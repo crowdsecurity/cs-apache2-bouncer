@@ -1,5 +1,5 @@
 #!/bin/sh
 
 a2dismod  mod_crowdsec
-systemctl reload apache2
+systemctl try-reload-or-restart apache2
 

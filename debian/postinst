@@ -20,5 +20,5 @@ a2enmod  mod_crowdsec
 if [ "$START" -eq 0 ]; then
     echo "no api key was generated, you can generate one on your LAPI server by running 'cscli bouncers add <bouncer_name>' and add it to '$CONFIG'" >&2
 else
-    systemctl reload apache2
+    systemctl try-reload-or-restart apache2
 fi

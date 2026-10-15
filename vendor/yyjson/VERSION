@@ -1,0 +1,5 @@
+yyjson 0.13.0
+https://github.com/ibireme/yyjson
+commit 6447536015f3d600f3d65323b10976103b337ca7
+Unmodified copies of src/yyjson.{c,h} and LICENSE (MIT).
+Compile-time options are set in Makefile.am, never by editing these files.

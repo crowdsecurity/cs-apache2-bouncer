@@ -23,9 +23,47 @@ checkout — the crowdsec engine repo vendors one as a submodule:
 /path/to/crowdsec/test/lib/bats-core/bin/bats test/bats/
 ```
 
-Requires `apache2` plus `mod_mpm_prefork`, `mod_authz_core`, `mod_dir`,
-`mod_proxy`, `mod_proxy_http` and `mod_socache_shmcb` in
-`/usr/lib/apache2/modules`, and `python3` for the stub LAPI and port probing.
+Requires `apache2` plus `mod_mpm_prefork`, `mod_mpm_event`, `mod_authz_core`,
+`mod_dir` and `mod_socache_shmcb` in `/usr/lib/apache2/modules`, and `python3`
+for the stub API and port probing.
+
+## What is covered
+
+| file | what it exercises |
+|---|---|
+| `blocked-http-code.bats` | the unset-default bug: a banned address must be blocked without `CrowdsecBlockedHTTPCode` |
+| `scan-conformance.bats` | the header sanitiser tables against Apache's own `ap_scan_*` |
+| `http-client.bats` | the libcurl layer: response ceiling, timeouts, closed port, handle reuse, `http_proxy` immunity |
+| `live-mode.bats` | per-request queries, the shared verdict cache, and every `CrowdsecFallback` value |
+| `stream-mode.bats` | background polling, ranges, deletion, expiry, the unprimed window |
+| `limits.bats` | cache too small, 100000 decisions, IPv6, many prefix lengths, malformed input, leader takeover |
+
+Both MPMs are covered; `HARNESS_MPM=event` switches, and tests needing several
+child processes use `mpm_many_children` so the directives are spelled correctly
+for whichever MPM is active.
+
+```
+HARNESS_MPM=event bats test/bats/
+```
+
+Set `HARNESS_LOGLEVEL` to raise Apache's log level, e.g.
+`HARNESS_LOGLEVEL="info socache_shmcb:trace5"` when investigating the cache.
+
+## Testing against a real engine
+
+The stubs implement the protocol as documented, which is not the same as
+implementing it as the engine really behaves. Point the module at a real
+crowdsec instead:
+
+```
+cscli bouncers add apache-test -o raw        # the key
+cscli decisions add --ip 127.0.0.1 --duration 10m
+cscli decisions add --range 127.0.0.0/24 --duration 10m
+```
+
+A run against a live engine holding 145000 real decisions confirmed the stream
+protocol, range matching, deletion within one poll, and the 16MB sizing figure
+above.
 
 ## Unit tests
 

@@ -29,13 +29,20 @@ typedef struct
     unsigned char addr[16];     /* network order; first 4 bytes used for v4 */
 } crowdsec_net_t;
 
-/* Longest key crowdsec_key_encode can emit: family + plen + 16 address bytes. */
-#define CROWDSEC_KEY_MAX 18
+/* Longest key crowdsec_key_encode can emit: spread byte + family + plen +
+ * 16 address bytes.
+ */
+#define CROWDSEC_KEY_MAX 19
 
 /* Refuse a configured size above this. The engine's own default max_body_size
  * is 10 MiB, so anything past 64 MiB is a misconfiguration we reject at
  * startup rather than discover under load.
  */
 #define CROWDSEC_SIZE_CEILING (64 * 1024 * 1024)
+
+/* Ten years. A decision longer than this is indistinguishable from forever,
+ * and clamping keeps the microsecond arithmetic away from overflow.
+ */
+#define CROWDSEC_DURATION_MAX (APR_TIME_C(10) * 365 * 24 * 3600 * APR_USEC_PER_SEC)
 
 #endif /* CROWDSEC_INTERNAL_H */

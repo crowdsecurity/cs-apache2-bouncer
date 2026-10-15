@@ -4,11 +4,11 @@ Name:      @PACKAGE_NAME@
 Version:   @PACKAGE_VERSION@
 Release:   1%{?dist}
 Summary:   Apache Crowdsec module
-License:   ASL 2.0
+License:   MIT
 Group:     System Environment/Daemons
 Source:    https://github.com/minfrin/%{name}/releases/download/%{name}-%{version}/%{name}-%{version}.tar.bz2
 Url:       https://github.com/minfrin/%{name}
-BuildRequires: gcc, pkgconfig(apr-1), pkgconfig(apr-util-1), (httpd-devel or apache-devel or apache2-devel)
+BuildRequires: gcc, pkgconfig(apr-1), pkgconfig(apr-util-1), pkgconfig(libcurl), (httpd-devel or apache-devel or apache2-devel)
 Requires: (httpd or apache or apache2)
 
 %if 0%{?suse_version}

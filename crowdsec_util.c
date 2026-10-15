@@ -15,6 +15,9 @@
 
 #include "crowdsec_util.h"
 
+/* must be last: see the file for why */
+#include "crowdsec_poison.h"
+
 /*
  * Apache's scanners live in libhttpd, which a standalone test binary cannot
  * link, so they are reproduced here. test/unit/mod_scan_conformance.c asserts
@@ -325,20 +328,32 @@ void crowdsec_ip_mask(const crowdsec_net_t *in, int plen, crowdsec_net_t *out)
 apr_size_t crowdsec_key_encode(const crowdsec_net_t *n, unsigned char *buf,
                                apr_size_t buflen)
 {
-    apr_size_t width, len;
+    apr_size_t width, len, i;
+    unsigned int h = 2166136261u;
 
     if (!n || !buf) {
         return 0;
     }
     width = (n->family == 6) ? 16 : 4;
-    len = 2 + width;            /* family, plen, network */
+    len = 3 + width;            /* spread, family, plen, network */
 
     if (buflen < len) {
         return 0;
     }
-    buf[0] = (unsigned char) n->family;
-    buf[1] = (unsigned char) n->plen;
-    memcpy(buf + 2, n->addr, width);
+    buf[1] = (unsigned char) n->family;
+    buf[2] = (unsigned char) n->plen;
+    memcpy(buf + 3, n->addr, width);
+
+    /* FNV-1a over the meaningful bytes. Derived from them, so a lookup
+     * recomputes the same leading byte.
+     */
+    for (i = 1; i < len; i++) {
+        h = (h ^ buf[i]) * 16777619u;
+    }
+    /* 0 is reserved for metadata keys, which must not share a subcache with
+     * decisions that could evict them.
+     */
+    buf[0] = (unsigned char) (h % 255u) + 1u;
 
     return len;
 }
@@ -369,4 +384,131 @@ crowdsec_rem_t crowdsec_action_to_rem(const char *action)
      * unknown action is expected, not a protocol error.
      */
     return CROWDSEC_REM_UNKNOWN;
+}
+
+/* Go's unit table, longest first so "ms" is not read as "m" followed by junk.
+ * "µs" appears as both U+00B5 and U+03BC in Go's own output.
+ */
+static const struct
+{
+    const char *unit;
+    apr_size_t len;
+    apr_interval_time_t usec;
+} duration_units[] = {
+    { "ns", 2, 0 },             /* below our resolution; contributes nothing */
+    { "us", 2, 1 },
+    { "\xc2\xb5s", 3, 1 },      /* U+00B5 MICRO SIGN */
+    { "\xce\xbcs", 3, 1 },      /* U+03BC GREEK SMALL LETTER MU */
+    { "ms", 2, 1000 },
+    { "s", 1, APR_USEC_PER_SEC },
+    { "m", 1, APR_TIME_C(60) * APR_USEC_PER_SEC },
+    { "h", 1, APR_TIME_C(3600) * APR_USEC_PER_SEC }
+};
+
+int crowdsec_parse_duration(const char *s, apr_interval_time_t *out)
+{
+    apr_interval_time_t total = 0;
+    int negative = 0;
+    int groups = 0;
+
+    if (!s || !out) {
+        return 0;
+    }
+    if (*s == '-') {
+        negative = 1;
+        s++;
+    }
+    else if (*s == '+') {
+        s++;
+    }
+    /* Go spells a zero duration "0s", but bare "0" shows up in hand-written
+     * config, so accept it.
+     */
+    if (!strcmp(s, "0")) {
+        *out = 0;
+        return 1;
+    }
+    if (!*s) {
+        return 0;
+    }
+
+    while (*s) {
+        apr_interval_time_t whole = 0, scaled;
+        apr_interval_time_t frac_num = 0, frac_den = 1;
+        int digits = 0;
+        unsigned u;
+
+        for (; *s >= '0' && *s <= '9'; s++) {
+            if (whole <= CROWDSEC_DURATION_MAX) {
+                whole = whole * 10 + (*s - '0');
+            }
+            /* Past the clamp the magnitude no longer matters, but keep
+             * consuming digits so the syntax check still sees the whole token.
+             */
+            digits++;
+        }
+        if (*s == '.') {
+            s++;
+            for (; *s >= '0' && *s <= '9'; s++) {
+                /* Keep at most 6 fractional digits: more cannot affect a
+                 * microsecond result.
+                 */
+                if (frac_den < 1000000) {
+                    frac_num = frac_num * 10 + (*s - '0');
+                    frac_den *= 10;
+                }
+                digits++;
+            }
+        }
+        if (!digits) {
+            return 0;
+        }
+
+        for (u = 0; u < sizeof(duration_units) / sizeof(duration_units[0]);
+             u++) {
+            if (!strncmp(s, duration_units[u].unit, duration_units[u].len)) {
+                break;
+            }
+        }
+        if (u == sizeof(duration_units) / sizeof(duration_units[0])) {
+            return 0;           /* missing or unknown unit */
+        }
+        s += duration_units[u].len;
+
+        if (duration_units[u].usec == 0) {
+            groups++;           /* ns: valid, but rounds away */
+            continue;
+        }
+        /* Saturate rather than fail. Rejecting an absurd duration would make
+         * the caller drop the decision, and dropping a ban fails open; an
+         * over-long ban is merely treated as permanent, which it effectively
+         * is. Genuine syntax errors are still rejected above.
+         */
+        if (whole > CROWDSEC_DURATION_MAX / duration_units[u].usec) {
+            total = CROWDSEC_DURATION_MAX;
+            groups++;
+            continue;
+        }
+        scaled = whole * duration_units[u].usec;
+        if (frac_den > 1) {
+            scaled += (frac_num * duration_units[u].usec) / frac_den;
+        }
+        if (total > CROWDSEC_DURATION_MAX - scaled) {
+            total = CROWDSEC_DURATION_MAX;
+        }
+        else {
+            total += scaled;
+        }
+        groups++;
+    }
+
+    if (!groups) {
+        return 0;
+    }
+    if (total > CROWDSEC_DURATION_MAX) {
+        total = CROWDSEC_DURATION_MAX;
+    }
+    *out = negative ? -total : total;
+
+    return 1;
 }

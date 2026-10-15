@@ -45,11 +45,31 @@ int crowdsec_cidr_parse(const char *s, crowdsec_net_t *out);
 /* Copy in, truncated to plen bits, with the host bits zeroed. */
 void crowdsec_ip_mask(const crowdsec_net_t *in, int plen, crowdsec_net_t *out);
 
-/* Fixed-width binary socache key. Returns the length written, or 0 if buflen
- * is too small. Never emits a key shorter than 4 bytes, which shmcb rejects.
+/* Fixed-width binary socache key.
+ *
+ * The leading byte is a hash of everything after it, because mod_socache_shmcb
+ * chooses a subcache from the FIRST BYTE of the key. A key beginning with a
+ * constant - the address family, say - puts every entry in one subcache out of
+ * 256, capping the cache at a few hundred entries however large it is. The
+ * byte is forced into 1..255 so subcache 0 stays reserved for this module's
+ * metadata and decision churn cannot evict it.
+ *
+ * Returns the length written, or 0 if buflen is too small. The shortest key is
+ * 7 bytes, comfortably over shmcb's 4-byte minimum.
  */
 apr_size_t crowdsec_key_encode(const crowdsec_net_t *n, unsigned char *buf,
                                apr_size_t buflen);
+
+/* A Go time.Duration string, as LAPI emits for a decision: "1h0m0s", "59m",
+ * "0s", or a negative one for a decision that has already expired. Accepts the
+ * full grammar (sign, fractions, ns/us/µs/ms/s/m/h) rather than just what the
+ * current server happens to produce. Result is clamped to
+ * CROWDSEC_DURATION_MAX, saturating rather than failing: refusing an
+ * over-long duration would make the caller drop the decision, and dropping a
+ * ban fails open. Returns 1 on success; *out may be <= 0, meaning already
+ * expired, which the caller should drop rather than store.
+ */
+int crowdsec_parse_duration(const char *s, apr_interval_time_t *out);
 
 /* allow < unknown < captcha < challenge < ban */
 crowdsec_rem_t crowdsec_rem_merge(crowdsec_rem_t a, crowdsec_rem_t b);

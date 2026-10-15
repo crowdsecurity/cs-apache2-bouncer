@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "apr_general.h"
+#include "apr_strings.h"
 
 #include "crowdsec_util.h"
 
@@ -167,6 +168,63 @@ static void test_body_take(void)
     }
 }
 
+static void test_duration(void)
+{
+    apr_interval_time_t v;
+
+    struct { const char *in; int ok; apr_interval_time_t want; } t[] = {
+        /* what LAPI actually emits: Round(time.Second).String() */
+        { "0s", 1, 0 },
+        { "3s", 1, 3 * APR_USEC_PER_SEC },
+        { "1m0s", 1, 60 * APR_USEC_PER_SEC },
+        { "1h0m0s", 1, 3600 * APR_USEC_PER_SEC },
+        { "1h59m", 1, (3600 + 59 * 60) * APR_USEC_PER_SEC },
+        { "2h59m0s", 1, (2 * 3600 + 59 * 60) * APR_USEC_PER_SEC },
+        /* an expired decision arrives negative; the caller must drop it */
+        { "-1h0m0s", 1, -(APR_TIME_C(3600) * APR_USEC_PER_SEC) },
+        { "-1s", 1, -APR_USEC_PER_SEC },
+        /* the rest of Go's grammar, which other code paths do produce */
+        { "0", 1, 0 },
+        { "500ms", 1, 500 * 1000 },
+        { "1.5s", 1, 1500 * 1000 },
+        { "100us", 1, 100 },
+        { "1ns", 1, 0 },                  /* below our resolution */
+        { "1h30m45s", 1, (3600 + 1800 + 45) * APR_USEC_PER_SEC },
+        { "\xc2\xb5s" "1", 0, 0 },          /* unit before the number */
+        { "1\xc2\xb5s", 1, 1 },             /* U+00B5 micro sign */
+        { "1\xce\xbcs", 1, 1 },             /* U+03BC greek mu */
+        /* rejections */
+        { "", 0, 0 }, { "-", 0, 0 }, { "1", 0, 0 },     /* no unit */
+        { "s", 0, 0 }, { "1x", 0, 0 }, { "1 s", 0, 0 },
+        { "1h30", 0, 0 },                 /* trailing number with no unit */
+        { "abc", 0, 0 },
+        { ".5s", 1, 500 * 1000 },         /* Go accepts a bare fraction */
+    };
+    unsigned i;
+
+    for (i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        v = APR_INT64_C(-999);
+        CHECK(crowdsec_parse_duration(t[i].in, &v) == t[i].ok,
+              "parse_duration(%s) ok", t[i].in);
+        if (t[i].ok) {
+            CHECK(v == t[i].want,
+                  "parse_duration(%s) = %" APR_TIME_T_FMT " want %"
+                  APR_TIME_T_FMT, t[i].in, v, t[i].want);
+        }
+    }
+    /* Saturate, never reject: rejecting would drop the decision, and dropping
+     * a ban fails open.
+     */
+    CHECK(crowdsec_parse_duration("2562047h47m16s", &v)
+          && v == CROWDSEC_DURATION_MAX, "max go duration clamps");
+    CHECK(crowdsec_parse_duration("99999999999999999999h", &v)
+          && v == CROWDSEC_DURATION_MAX, "absurd duration clamps, not rejected");
+    CHECK(crowdsec_parse_duration("-99999999999999999999h", &v)
+          && v == -CROWDSEC_DURATION_MAX, "absurd negative clamps");
+    CHECK(crowdsec_parse_duration(NULL, &v) == 0, "NULL in");
+    CHECK(crowdsec_parse_duration("1s", NULL) == 0, "NULL out");
+}
+
 static void test_cidr(void)
 {
     crowdsec_net_t n;
@@ -247,16 +305,46 @@ static void test_key_encode(void)
 
     CHECK(crowdsec_cidr_parse("1.2.3.4", &n), "parse");
     len = crowdsec_key_encode(&n, buf, sizeof(buf));
-    CHECK(len == 6, "v4 key is 6 bytes");
-    /* shmcb rejects keys under 4 bytes; the shortest we can emit is 6 */
+    CHECK(len == 7, "v4 key is 7 bytes");
+    /* shmcb rejects keys under 4 bytes; the shortest we emit is 7 */
     CHECK(len >= 4, "v4 key clears the shmcb minimum");
-    CHECK(buf[0] == 4 && buf[1] == 32, "v4 key header");
+    CHECK(buf[1] == 4 && buf[2] == 32, "v4 key header");
+    CHECK(buf[0] != 0, "leading byte is never 0, which is reserved for meta");
 
     CHECK(crowdsec_cidr_parse("::1", &n), "parse v6");
     len = crowdsec_key_encode(&n, buf, sizeof(buf));
-    CHECK(len == 18, "v6 key is 18 bytes");
+    CHECK(len == 19, "v6 key is 19 bytes");
     CHECK(len <= CROWDSEC_KEY_MAX, "v6 key fits CROWDSEC_KEY_MAX");
-    CHECK(buf[0] == 6 && buf[1] == 128, "v6 key header");
+    CHECK(buf[1] == 6 && buf[2] == 128, "v6 key header");
+    CHECK(buf[0] != 0, "v6 leading byte is never 0");
+
+    /* shmcb picks a subcache from the first key byte, so a structured key must
+     * not start with a constant or the whole cache collapses into one
+     * subcache. Check the leading byte actually spreads.
+     */
+    {
+        unsigned char seen[256];
+        crowdsec_net_t m;
+        unsigned char k[CROWDSEC_KEY_MAX];
+        int distinct = 0, j;
+        char ip[32];
+
+        memset(seen, 0, sizeof(seen));
+        for (j = 0; j < 512; j++) {
+            apr_snprintf(ip, sizeof(ip), "10.%d.%d.%d",
+                         (j >> 16) & 255, (j >> 8) & 255, j & 255);
+            CHECK(crowdsec_cidr_parse(ip, &m), "gen %s", ip);
+            crowdsec_key_encode(&m, k, sizeof(k));
+            CHECK(k[0] != 0, "spread byte never 0");
+            if (!seen[k[0]]) {
+                seen[k[0]] = 1;
+                distinct++;
+            }
+        }
+        /* 512 sequential addresses should touch most of the 255 buckets */
+        CHECK(distinct > 180, "leading byte spreads: %d distinct of 255",
+              distinct);
+    }
 
     /* families must not collide even with identical trailing bytes */
     {
@@ -314,6 +402,7 @@ int main(void)
     test_version();
     test_size();
     test_body_take();
+    test_duration();
     test_cidr();
     test_key_encode();
     test_rem();

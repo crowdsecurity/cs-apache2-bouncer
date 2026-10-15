@@ -492,6 +492,19 @@ static int crowdsec_proxy(request_rec * r, const char **response)
     return OK;
 }
 
+/*
+ * CrowdsecBlockedHTTPCode gets no default in create_crowdsec_dir_config, and
+ * Apache spells success as OK == 0 - so an unset directive returned 0 from
+ * crowdsec_query, which check_access reads as DECLINED, and the banned request
+ * went through. Resolve the default here rather than in the config creator, so
+ * that an unset parent scope is not mistaken for one that set it explicitly.
+ */
+static int crowdsec_blocked_code(crowdsec_config_rec * conf)
+{
+    return conf->blockedhttpcode_set ? conf->blockedhttpcode :
+        HTTP_TOO_MANY_REQUESTS;
+}
+
 static int crowdsec_query(request_rec * r)
 {
 
@@ -553,8 +566,8 @@ static int crowdsec_query(request_rec * r)
                       "request redirected to '%s': %s",
                       r->useragent_ip, response, location, r->uri);
 
-        ap_custom_response(r, conf->blockedhttpcode, location);
-        return conf->blockedhttpcode;
+        ap_custom_response(r, crowdsec_blocked_code(conf), location);
+        return crowdsec_blocked_code(conf);
     }
 
     else {
@@ -562,7 +575,7 @@ static int crowdsec_query(request_rec * r)
                       "crowdsec: ip address '%s' lookup returned %s, "
                       "request rejected: %s",
                       r->useragent_ip, response, r->uri);
-        return conf->blockedhttpcode;
+        return crowdsec_blocked_code(conf);
     }
 
 }

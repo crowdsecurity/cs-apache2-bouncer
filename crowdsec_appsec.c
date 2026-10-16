@@ -379,7 +379,7 @@ crowdsec_appsec_res_t crowdsec_appsec_check(request_rec *r,
     crowdsec_buf_t buf;
     crowdsec_http_err_t herr;
     hdr_ctx_t hctx;
-    struct curl_slist *hdrs = NULL;
+    struct curl_slist **hdrs;
     const char *target, *host, *ua, *version, *txid, *perr = NULL;
     long status = 0;
     char errbuf[256];
@@ -445,12 +445,18 @@ crowdsec_appsec_res_t crowdsec_appsec_check(request_rec *r,
         return CROWDSEC_APPSEC_FAIL;
     }
 
-    apr_pool_cleanup_register(r->pool, &hdrs, crowdsec_http_headers_cleanup,
+    /* The holder lives in the pool, not on the stack: this cleanup runs when
+     * r->pool is destroyed, after this function has returned, and a registered
+     * stack address would by then be a dead frame - handing
+     * curl_slist_free_all whatever happened to occupy it.
+     */
+    hdrs = apr_pcalloc(r->pool, sizeof(*hdrs));
+    apr_pool_cleanup_register(r->pool, hdrs, crowdsec_http_headers_cleanup,
                               apr_pool_cleanup_null);
 
     /* The client's own headers first, then ours on top. */
     hctx.pool = r->pool;
-    hctx.list = &hdrs;
+    hctx.list = hdrs;
     hctx.ok = 1;
     apr_table_do(forward_one_header, &hctx, r->headers_in, NULL);
     if (!hctx.ok) {
@@ -462,10 +468,10 @@ crowdsec_appsec_res_t crowdsec_appsec_check(request_rec *r,
     version = crowdsec_http_version_hdr(r->proto_num);
     txid = transaction_id(r);
 
-    if (!crowdsec_http_header_add(r->pool, &hdrs, H_KEY, sconf->appsec_key)
-        || !crowdsec_http_header_add(r->pool, &hdrs, H_IP, ip)
-        || !crowdsec_http_header_add(r->pool, &hdrs, H_URI, target)
-        || !crowdsec_http_header_add(r->pool, &hdrs, H_VERB, r->method)) {
+    if (!crowdsec_http_header_add(r->pool, hdrs, H_KEY, sconf->appsec_key)
+        || !crowdsec_http_header_add(r->pool, hdrs, H_IP, ip)
+        || !crowdsec_http_header_add(r->pool, hdrs, H_URI, target)
+        || !crowdsec_http_header_add(r->pool, hdrs, H_VERB, r->method)) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                       "crowdsec: could not build the appsec request headers");
         return CROWDSEC_APPSEC_BADREQ;
@@ -474,19 +480,19 @@ crowdsec_appsec_res_t crowdsec_appsec_check(request_rec *r,
      * host-based rules silently never match.
      */
     if (host) {
-        crowdsec_http_header_add(r->pool, &hdrs, H_HOST, host);
+        crowdsec_http_header_add(r->pool, hdrs, H_HOST, host);
     }
     /* If no user agent is forwarded the engine deletes the header entirely,
      * which is the right outcome for a client that sent none.
      */
     if (ua && crowdsec_hdr_value_ok(ua)) {
-        crowdsec_http_header_add(r->pool, &hdrs, H_UA, ua);
+        crowdsec_http_header_add(r->pool, hdrs, H_UA, ua);
     }
     if (version) {
-        crowdsec_http_header_add(r->pool, &hdrs, H_VERSION, version);
+        crowdsec_http_header_add(r->pool, hdrs, H_VERSION, version);
     }
     if (txid && crowdsec_hdr_value_ok(txid)) {
-        crowdsec_http_header_add(r->pool, &hdrs, H_TXID, txid);
+        crowdsec_http_header_add(r->pool, hdrs, H_TXID, txid);
     }
 
     /* Suppress what libcurl would otherwise add on its own. Each extra header
@@ -494,21 +500,21 @@ crowdsec_appsec_res_t crowdsec_appsec_check(request_rec *r,
      * by this module would hash differently from the same request relayed by
      * any other remediation component.
      */
-    crowdsec_http_header_add_raw(&hdrs, "Accept:");
-    crowdsec_http_header_add_raw(&hdrs, "Expect:");
-    crowdsec_http_header_add_raw(&hdrs, "Content-Type:");
+    crowdsec_http_header_add_raw(hdrs, "Accept:");
+    crowdsec_http_header_add_raw(hdrs, "Expect:");
+    crowdsec_http_header_add_raw(hdrs, "Content-Type:");
     if (!ua) {
-        crowdsec_http_header_add_raw(&hdrs, "User-Agent:");
+        crowdsec_http_header_add_raw(hdrs, "User-Agent:");
     }
     if (!apr_table_get(r->headers_in, "Accept-Encoding")) {
-        crowdsec_http_header_add_raw(&hdrs, "Accept-Encoding:");
+        crowdsec_http_header_add_raw(hdrs, "Accept-Encoding:");
     }
 
     memset(&req, 0, sizeof(req));
     req.url = apr_pstrcat(r->pool, sconf->appsec_url, sconf->appsec_path,
                           NULL);
     req.unix_socket = sconf->appsec_socket;
-    req.headers = hdrs;
+    req.headers = *hdrs;
     req.connect_timeout = sconf->appsec_connect_timeout;
     req.timeout = sconf->appsec_timeout;
     req.low_speed_time = apr_time_from_sec(1);

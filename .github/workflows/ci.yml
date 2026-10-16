@@ -1,0 +1,154 @@
+---
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+
+permissions:
+  contents: read
+
+env:
+  # apache2-dev brings apxs and the httpd headers; apache2 brings the MPMs and
+  # the modules the functional harness loads (proxy, rewrite, cgid, deflate,
+  # socache_shmcb). bats is packaged on both runners.
+  DEPS: >-
+    apache2 apache2-dev apache2-utils
+    libapr1-dev libaprutil1-dev libcurl4-openssl-dev
+    autoconf automake libtool pkg-config bats
+
+jobs:
+  # 22.04 is not redundant: libcurl there is 7.81, which takes the
+  # CURLOPT_PROTOCOLS fallback rather than CURLOPT_PROTOCOLS_STR (7.85+).
+  build:
+    name: build + unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends $DEPS
+
+      - name: configure
+        run: |
+          autoreconf -fi
+          ./configure --with-apxs=/usr/bin/apxs2 --enable-werror
+
+      - name: build
+        run: make
+
+      - name: unit tests
+        run: make check || { cat test/unit/*.log 2>/dev/null; exit 1; }
+
+  functional:
+    name: bats (${{ matrix.os }}, mpm_${{ matrix.mpm }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        mpm: [prefork, event]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends $DEPS
+
+      - name: build the module and the test helpers
+        run: |
+          autoreconf -fi
+          ./configure --with-apxs=/usr/bin/apxs2 --enable-werror
+          make
+          make check
+          # The scanner-conformance module runs inside httpd, where ap_scan_*
+          # resolves; it is not part of the default target.
+          apxs2 -c -I. -o test/unit/mod_scan_conformance.la \
+            test/unit/mod_scan_conformance.c crowdsec_util.c
+
+      - name: stop the distro apache
+        # The runner has apache2 enabled on :80; the harness starts its own
+        # instance on a free port, but a running server competes for the
+        # default runtime directory and mutex names.
+        run: sudo systemctl stop apache2 || true
+
+      - name: bats
+        env:
+          HARNESS_MPM: ${{ matrix.mpm }}
+        # --print-output-on-failure arrived in bats-core 1.5; 22.04 packages
+        # 1.2, which exits on an unknown flag. Ask before using it.
+        run: |
+          flags=
+          if bats --help 2>&1 | grep -q -- --print-output-on-failure; then
+            flags=--print-output-on-failure
+          fi
+          bats $flags test/bats/
+
+  sanitizers:
+    name: asan + ubsan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends $DEPS
+
+      - name: build and run the unit drivers instrumented
+        # detect_stack_use_after_return is the setting that would have caught
+        # the pool cleanup registered against a stack address; it is off by
+        # default, so asking for it explicitly is the point of this job.
+        run: |
+          autoreconf -fi
+          ./configure --with-apxs=/usr/bin/apxs2
+          SAN="-fsanitize=address,undefined -fno-sanitize-recover=all"
+          SAN="$SAN -fsanitize-address-use-after-scope -g -Wall -Wextra -Werror"
+          YY="-DYYJSON_READER_DEPTH_LIMIT=8 -DYYJSON_DISABLE_WRITER=1"
+          YY="$YY -DYYJSON_DISABLE_INCR_READER=1 -DYYJSON_DISABLE_NON_STANDARD=1"
+          YY="$YY -DYYJSON_DISABLE_FILE=1 -DYYJSON_DISABLE_UTILS=1"
+          APR="$(pkg-config --cflags apr-1)"
+          gcc $SAN $APR -I. test/unit/t_util.c crowdsec_util.c \
+            $(pkg-config --libs apr-1) -o t_util_san
+          gcc $SAN $APR -I. -I./vendor/yyjson $YY test/unit/t_verdict.c \
+            crowdsec_verdict.c crowdsec_util.c vendor/yyjson/yyjson.c \
+            $(pkg-config --libs apr-1) -o t_verdict_san
+          export ASAN_OPTIONS=detect_stack_use_after_return=1:detect_leaks=1
+          ./t_util_san
+          ./t_verdict_san
+
+  package:
+    name: dpkg-buildpackage
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            build-essential debhelper devscripts dpkg-dev $DEPS
+
+      # The only job that notices a missing Build-Depends. It will not catch
+      # distros that ship uutils coreutils instead of GNU: both runners are
+      # GNU, and that difference broke postinst on Ubuntu 26.04 - see
+      # scripts/_bouncer.sh.
+      - name: build the package
+        run: dpkg-buildpackage -us -uc -b
+
+      - name: show what was produced
+        run: dpkg -c ../crowdsec-apache2-bouncer_*.deb

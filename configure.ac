@@ -81,6 +81,28 @@ AC_ARG_ENABLE([werror],
   [AS_IF([test "x$enableval" = xyes],
          [CROWDSEC_WARN_CFLAGS="$CROWDSEC_WARN_CFLAGS -Werror"])])
 
+# Fuzzing is a developer tool, not part of make check: libFuzzer needs clang,
+# and the targets run for as long as you let them. See fuzz/README.md.
+AC_ARG_ENABLE([fuzzing],
+  [AS_HELP_STRING([--enable-fuzzing],
+                  [build the fuzz targets (requires clang and libFuzzer)])],
+  [AS_IF([test "x$enableval" = xyes], [enable_fuzzing=yes])],
+  [enable_fuzzing=no])
+AM_CONDITIONAL([FUZZING], [test "x$enable_fuzzing" = xyes])
+AS_IF([test "x$enable_fuzzing" = xyes], [
+  AC_MSG_CHECKING([whether $CC accepts -fsanitize=fuzzer])
+  save_cflags="$CFLAGS"
+  CFLAGS="$CFLAGS -fsanitize=fuzzer-no-link"
+  AC_COMPILE_IFELSE([AC_LANG_PROGRAM([],[])],
+    [AC_MSG_RESULT([yes])],
+    [AC_MSG_RESULT([no])
+     AC_MSG_ERROR([--enable-fuzzing needs a compiler with libFuzzer; try CC=clang])])
+  CFLAGS="$save_cflags"
+  FUZZ_CFLAGS="-fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all"
+  FUZZ_CFLAGS="$FUZZ_CFLAGS -fsanitize-address-use-after-scope -g"
+])
+AC_SUBST(FUZZ_CFLAGS)
+
 CFLAGS="$CFLAGS $apr_CFLAGS $apu_CFLAGS"
 CPPFLAGS="$CPPFLAGS $apr_CPPFLAGS $apu_CPPFLAGS"
 LDFLAGS="$LDFLAGS $apr_LIBS $apu_LIBS"

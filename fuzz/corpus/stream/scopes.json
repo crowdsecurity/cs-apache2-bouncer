@@ -1,0 +1,1 @@
+{"new":[{"duration":"1h0m0s","id":5,"origin":"CAPI","scenario":"z","scope":"Country","type":"ban","value":"FR"},{"duration":"-5s","id":6,"origin":"cscli","scenario":"q","scope":"Ip","type":"ban","value":"9.9.9.9"}],"deleted":null}

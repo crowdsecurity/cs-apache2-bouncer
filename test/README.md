@@ -101,3 +101,9 @@ apxs -c -I. -o test/unit/mod_scan_conformance.la \
 ```
 
 Both will move under `make check` when the build changes land.
+
+## Fuzzing
+
+The JSON parsers and the header sanitisers have libFuzzer targets under
+`fuzz/`, with post-conditions rather than bare crash checks. They need clang
+and are not part of `make check` or CI. See `fuzz/README.md`.

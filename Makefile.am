@@ -59,6 +59,41 @@ clean-local:
 # --- tests -----------------------------------------------------------------
 # Unit tests link apr directly and need no server.
 
+# --- fuzzing -------------------------------------------------------------
+# Not in check_PROGRAMS: these never terminate on their own, and they need
+# clang. "make fuzz" builds them; fuzz/README.md has the invocations.
+FUZZ_TARGETS = fuzz/fuzz_verdict fuzz/fuzz_stream fuzz/fuzz_hdr
+
+if FUZZING
+noinst_PROGRAMS = $(FUZZ_TARGETS)
+
+fuzz_fuzz_verdict_SOURCES = fuzz/fuzz_verdict.c crowdsec_verdict.c \
+                            crowdsec_util.c vendor/yyjson/yyjson.c
+fuzz_fuzz_verdict_CPPFLAGS = $(AM_CPPFLAGS) $(YYJSON_DEFS)
+fuzz_fuzz_verdict_CFLAGS = $(FUZZ_CFLAGS)
+fuzz_fuzz_verdict_LDFLAGS = $(FUZZ_CFLAGS)
+fuzz_fuzz_verdict_LDADD = $(apr_LIBS)
+
+fuzz_fuzz_stream_SOURCES = fuzz/fuzz_stream.c crowdsec_verdict.c \
+                           crowdsec_util.c vendor/yyjson/yyjson.c
+fuzz_fuzz_stream_CPPFLAGS = $(AM_CPPFLAGS) $(YYJSON_DEFS)
+fuzz_fuzz_stream_CFLAGS = $(FUZZ_CFLAGS)
+fuzz_fuzz_stream_LDFLAGS = $(FUZZ_CFLAGS)
+fuzz_fuzz_stream_LDADD = $(apr_LIBS)
+
+fuzz_fuzz_hdr_SOURCES = fuzz/fuzz_hdr.c crowdsec_util.c
+fuzz_fuzz_hdr_CPPFLAGS = $(AM_CPPFLAGS)
+fuzz_fuzz_hdr_CFLAGS = $(FUZZ_CFLAGS)
+fuzz_fuzz_hdr_LDFLAGS = $(FUZZ_CFLAGS)
+fuzz_fuzz_hdr_LDADD = $(apr_LIBS)
+
+fuzz: $(FUZZ_TARGETS)
+else
+fuzz:
+	@echo "configure with --enable-fuzzing CC=clang first" >&2; exit 1
+endif
+.PHONY: fuzz
+
 check_PROGRAMS = test/unit/t_util test/unit/t_verdict test/unit/t_http
 TESTS = $(check_PROGRAMS)
 

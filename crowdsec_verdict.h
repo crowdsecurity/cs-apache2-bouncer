@@ -16,6 +16,18 @@
 #define CROWDSEC_MAX_DECISIONS 2000000
 #define CROWDSEC_MAX_FIELD_LEN 256
 
+/* Bounds on an AppSec verdict. user_headers and user_cookies come from the
+ * engine, but their contents are influenced by whoever wrote the appsec
+ * configuration, so they are bounded like any other input. The challenge page
+ * itself is not capped here: it is already bounded by the response ceiling,
+ * and a legitimate one is a few hundred kilobytes.
+ */
+#define CROWDSEC_MAX_HEADERS      32
+#define CROWDSEC_MAX_HEADER_VALS   8
+#define CROWDSEC_MAX_COOKIES       8
+#define CROWDSEC_MAX_HEADER_NAME 256
+#define CROWDSEC_MAX_HEADER_VAL  4096
+
 typedef struct
 {
     crowdsec_net_t net;         /* already masked to its prefix */
@@ -49,5 +61,37 @@ int crowdsec_stream_parse(const char *buf, apr_size_t len, apr_pool_t *p,
  */
 int crowdsec_decisions_any(const char *buf, apr_size_t len, apr_pool_t *p,
                            int *any, const char **err);
+
+typedef struct
+{
+    const char *name;
+    const char *value;
+} crowdsec_hdr_t;
+
+typedef struct
+{
+    crowdsec_rem_t rem;
+    const char *action;         /* verbatim, for logging an unknown one */
+    int http_status;            /* what the browser gets, not what we got */
+
+    /* Only populated for action challenge. */
+    const char *content_type;   /* kept apart: must go through ap_set_content_type */
+    const char *body;
+    apr_size_t body_len;
+    const char **cookies;       /* complete Set-Cookie values */
+    apr_size_t ncookies;
+    crowdsec_hdr_t *headers;
+    apr_size_t nheaders;
+} crowdsec_appsec_verdict_t;
+
+/* An AppSec response body. Must be called for a 200 as well as a 403: with
+ * default_pass_action set, a 200 can still carry captcha or challenge.
+ *
+ * Everything in *out is copied into p, so the caller may use it after this
+ * returns. Returns 1 on success; on failure *err gets a short static reason
+ * and the caller applies its failure action.
+ */
+int crowdsec_appsec_parse(const char *buf, apr_size_t len, apr_pool_t *p,
+                          crowdsec_appsec_verdict_t *out, const char **err);
 
 #endif /* CROWDSEC_VERDICT_H */

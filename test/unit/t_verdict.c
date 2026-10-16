@@ -6,6 +6,7 @@
 
 #include "apr_general.h"
 #include "apr_pools.h"
+#include "apr_strings.h"
 
 #include "crowdsec_util.h"
 #include "crowdsec_verdict.h"
@@ -282,6 +283,205 @@ static void test_decisions_any(apr_pool_t *p)
           "truncated null rejected");
 }
 
+/* ------------------------------------------------------------ appsec */
+
+static int av(apr_pool_t *p, const char *json, crowdsec_appsec_verdict_t *out,
+              const char **err)
+{
+    return crowdsec_appsec_parse(json, strlen(json), p, out, err);
+}
+
+static void test_appsec_basic(apr_pool_t *p)
+{
+    crowdsec_appsec_verdict_t v;
+    const char *err;
+
+    CHECK(av(p, "{\"action\":\"allow\",\"http_status\":200}", &v, &err),
+          "allow: %s", err ? err : "");
+    CHECK(v.rem == CROWDSEC_REM_ALLOW && v.http_status == 200, "allow fields");
+
+    CHECK(av(p, "{\"action\":\"ban\",\"http_status\":403}", &v, &err), "ban");
+    CHECK(v.rem == CROWDSEC_REM_BAN && v.http_status == 403, "ban fields");
+
+    /* A 200 can still say captcha when default_pass_action is set, which is
+     * why the body is parsed on 200 as well as 403.
+     */
+    CHECK(av(p, "{\"action\":\"captcha\",\"http_status\":200}", &v, &err),
+          "captcha on a 200");
+    CHECK(v.rem == CROWDSEC_REM_CAPTCHA, "captcha maps to captcha");
+
+    /* An action invented by an administrator is legal and must not read as
+     * allow.
+     */
+    CHECK(av(p, "{\"action\":\"shenanigans\",\"http_status\":403}", &v, &err),
+          "unknown action parses");
+    CHECK(v.rem == CROWDSEC_REM_UNKNOWN, "unknown action is not allow");
+    CHECK(v.action && !strcmp(v.action, "shenanigans"),
+          "the raw action survives for logging");
+}
+
+static void test_appsec_challenge(apr_pool_t *p)
+{
+    crowdsec_appsec_verdict_t v;
+    const char *err;
+
+    CHECK(av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+              "\"user_body_content\":\"<html>hi</html>\","
+              "\"user_cookies\":[\"a=1; Path=/\",\"b=2; Path=/\"],"
+              "\"user_headers\":{\"Content-Security-Policy\":[\"default-src 'self'\"],"
+              "\"X-Thing\":\"v\"}}", &v, &err), "challenge: %s",
+              err ? err : "");
+    CHECK(v.rem == CROWDSEC_REM_CHALLENGE, "challenge action");
+    CHECK(v.body_len == 15 && v.body && !memcmp(v.body, "<html>hi</html>", 15),
+          "body copied with its length");
+    CHECK(v.ncookies == 2, "two cookies");
+    CHECK(v.cookies[0] && !strcmp(v.cookies[0], "a=1; Path=/"), "cookie 0");
+    CHECK(v.nheaders == 2, "two headers from one string and one array");
+
+    /* 307 with a Location is how a granted challenge cookie is delivered, so
+     * the status must never be assumed to be 200.
+     */
+    CHECK(av(p, "{\"action\":\"challenge\",\"http_status\":307,"
+              "\"user_body_content\":\"x\","
+              "\"user_headers\":{\"Location\":\"/somewhere\"}}", &v, &err),
+              "307 challenge");
+    CHECK(v.http_status == 307, "307 preserved");
+
+    /* An empty body is the caller's cue to fail closed; the parse itself
+     * succeeds so the caller can tell why.
+     */
+    CHECK(av(p, "{\"action\":\"challenge\",\"http_status\":200}", &v, &err),
+          "challenge with no body parses");
+    CHECK(v.body_len == 0, "no body reported");
+}
+
+static void test_appsec_injection(apr_pool_t *p)
+{
+    crowdsec_appsec_verdict_t v;
+    const char *err;
+
+    /* The whole point of validating engine-supplied headers: a CR or LF would
+     * end our header and begin one of someone else's choosing.
+     */
+    CHECK(!av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+               "\"user_body_content\":\"x\","
+               "\"user_headers\":{\"X\":\"a\\r\\nEvil: 1\"}}", &v, &err),
+               "CRLF in a header value is refused");
+    CHECK(!av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+               "\"user_body_content\":\"x\","
+               "\"user_cookies\":[\"a=1\\r\\nEvil: 1\"]}", &v, &err),
+               "CRLF in a cookie is refused");
+    CHECK(!av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+               "\"user_body_content\":\"x\","
+               "\"user_headers\":{\"X\\r\\nY\":\"v\"}}", &v, &err),
+               "CRLF in a header name is refused");
+    /* An escaped NUL makes the reported length disagree with strlen. */
+    CHECK(!av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+               "\"user_body_content\":\"x\","
+               "\"user_headers\":{\"X\":\"a\\u0000b\"}}", &v, &err),
+               "embedded NUL in a header value is refused");
+
+    /* Framing headers are dropped rather than rejected: the engine may send a
+     * Content-Type it believes in, and we set ours from Apache instead.
+     */
+    CHECK(av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+              "\"user_body_content\":\"x\","
+              "\"user_headers\":{\"Content-Length\":\"99\","
+              "\"Transfer-Encoding\":\"chunked\",\"Content-Type\":\"text/x\","
+              "\"Server\":\"nginx\",\"X-Keep\":\"yes\"}}", &v, &err),
+              "framing headers dropped: %s", err ? err : "");
+    CHECK(v.nheaders == 1 && !strcmp(v.headers[0].name, "X-Keep"),
+          "only the safe header survived");
+    /* Content-Type is extracted rather than dropped: the engine picks a
+     * different one per challenge asset, and losing it would leave the browser
+     * sniffing a script as html.
+     */
+    CHECK(v.content_type && !strcmp(v.content_type, "text/x"),
+          "content-type extracted separately");
+
+    /* user_headers is map[string][]string, so this is the form the engine
+     * really sends; a bare string is accepted too.
+     */
+    CHECK(av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+              "\"user_body_content\":\"x\","
+              "\"user_headers\":{\"Content-Type\":[\"application/javascript\"]}}",
+              &v, &err), "js content-type as an array: %s", err ? err : "");
+    CHECK(v.content_type
+          && !strcmp(v.content_type, "application/javascript"),
+          "array content-type preserved");
+    CHECK(!av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+               "\"user_body_content\":\"x\","
+               "\"user_headers\":{\"Content-Type\":[\"a/b\",\"c/d\"]}}",
+               &v, &err), "two content types refused");
+
+    CHECK(av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+              "\"user_body_content\":\"x\","
+              "\"user_headers\":{\"Content-Type\":\"application/javascript\"}}",
+              &v, &err), "js content-type");
+    CHECK(v.content_type
+          && !strcmp(v.content_type, "application/javascript"),
+          "javascript content-type preserved");
+    CHECK(v.nheaders == 0, "content-type is not also in the header list");
+}
+
+static void test_appsec_bounds(apr_pool_t *p)
+{
+    crowdsec_appsec_verdict_t v;
+    const char *err;
+    char big[8192];
+    char *json;
+    apr_size_t i;
+
+    CHECK(!av(p, "{\"http_status\":200}", &v, &err), "no action refused");
+    CHECK(!av(p, "{\"action\":\"ban\"}", &v, &err), "no http_status refused");
+    CHECK(!av(p, "{\"action\":\"ban\",\"http_status\":99}", &v, &err),
+          "status below 100 refused");
+    CHECK(!av(p, "{\"action\":\"ban\",\"http_status\":600}", &v, &err),
+          "status above 599 refused");
+    CHECK(!av(p, "{\"action\":\"ban\",\"http_status\":\"403\"}", &v, &err),
+          "status as a string refused");
+    CHECK(!av(p, "{\"action\":1,\"http_status\":403}", &v, &err),
+          "action as a number refused");
+    CHECK(!av(p, "[]", &v, &err), "array root refused");
+    CHECK(!av(p, "", &v, &err), "empty refused");
+    CHECK(!av(p, "{", &v, &err), "truncated refused");
+
+    /* An over-long header value must be refused, not truncated. */
+    for (i = 0; i < sizeof(big) - 1; i++) {
+        big[i] = 'a';
+    }
+    big[sizeof(big) - 1] = '\0';
+    json = apr_psprintf(p, "{\"action\":\"challenge\",\"http_status\":200,"
+                        "\"user_body_content\":\"x\","
+                        "\"user_headers\":{\"X\":\"%s\"}}", big);
+    CHECK(!av(p, json, &v, &err), "over-long header value refused");
+
+    /* Too many cookies. */
+    CHECK(!av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+               "\"user_body_content\":\"x\",\"user_cookies\":"
+               "[\"a\",\"b\",\"c\",\"d\",\"e\",\"f\",\"g\",\"h\",\"i\"]}",
+               &v, &err), "too many cookies refused");
+
+    /* Wrong types inside the collections. */
+    CHECK(!av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+               "\"user_body_content\":\"x\",\"user_cookies\":[1]}",
+               &v, &err), "numeric cookie refused");
+    CHECK(!av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+               "\"user_body_content\":\"x\","
+               "\"user_headers\":{\"X\":1}}", &v, &err),
+               "numeric header value refused");
+    CHECK(!av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+               "\"user_body_content\":\"x\","
+               "\"user_headers\":[]}", &v, &err),
+               "array for user_headers refused");
+
+    /* A body containing a NUL is legal: it is written by length. */
+    CHECK(av(p, "{\"action\":\"challenge\",\"http_status\":200,"
+              "\"user_body_content\":\"a\\u0000b\"}", &v, &err),
+              "NUL in the body is data, not an injection");
+    CHECK(v.body_len == 3, "body length counts the NUL");
+}
+
 int main(void)
 {
     apr_pool_t *p;
@@ -299,6 +499,10 @@ int main(void)
     test_depth_limit(p);
     test_abort(p);
     test_decisions_any(p);
+    test_appsec_basic(p);
+    test_appsec_challenge(p);
+    test_appsec_injection(p);
+    test_appsec_bounds(p);
 
     apr_terminate();
 

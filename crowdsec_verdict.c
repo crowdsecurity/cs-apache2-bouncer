@@ -262,3 +262,281 @@ int crowdsec_decisions_any(const char *buf, apr_size_t len, apr_pool_t *p,
 
     return ok;
 }
+
+/* --------------------------------------------------------- appsec verdict */
+
+/* A header the engine must not be allowed to set on our response.
+ *
+ * The framing ones would desync Apache on a keep-alive connection; a
+ * Content-Encoding would make the browser try to inflate plain HTML; and
+ * Server or Date would let a WAF response impersonate the origin. Content-Type
+ * and Content-Length are handled through Apache's own setters instead, so the
+ * values it computes are the ones that go out.
+ */
+static int header_denied(const char *name)
+{
+    static const char *const denied[] = {
+        "transfer-encoding", "content-length", "connection", "keep-alive",
+        "upgrade", "trailer", "te", "content-encoding", "date", "server",
+        NULL
+    };
+    int i;
+
+    for (i = 0; denied[i]; i++) {
+        if (!strcasecmp(name, denied[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Copies a string out of the yyjson document, which is freed before we
+ * return, after checking it can safely become a header value. Rejects an
+ * embedded NUL by requiring the reported length to agree with strlen, and
+ * rejects anything Apache's own parser would not accept in a field value -
+ * which is what stops a CR or LF from splitting our response into two.
+ */
+static const char *dup_header_safe(apr_pool_t *p, yyjson_val *v,
+                                   apr_size_t max)
+{
+    const char *s;
+    size_t n;
+
+    if (!v || !yyjson_is_str(v)) {
+        return NULL;
+    }
+    s = yyjson_get_str(v);
+    n = yyjson_get_len(v);
+    if (!s || n == 0 || n > max || n != strlen(s)) {
+        return NULL;
+    }
+    if (!crowdsec_hdr_value_ok(s)) {
+        return NULL;
+    }
+    return apr_pstrmemdup(p, s, n);
+}
+
+static int parse_cookies(yyjson_val *arr, apr_pool_t *p,
+                         crowdsec_appsec_verdict_t *out)
+{
+    yyjson_val *item;
+    yyjson_arr_iter it;
+    apr_size_t n;
+
+    if (!arr || yyjson_is_null(arr)) {
+        return 1;
+    }
+    if (!yyjson_is_arr(arr)) {
+        return 0;
+    }
+    n = yyjson_arr_size(arr);
+    if (n > CROWDSEC_MAX_COOKIES) {
+        return 0;
+    }
+    out->cookies = apr_pcalloc(p, (n ? n : 1) * sizeof(*out->cookies));
+    if (!out->cookies) {
+        return 0;
+    }
+    yyjson_arr_iter_init(arr, &it);
+    while ((item = yyjson_arr_iter_next(&it))) {
+        const char *v = dup_header_safe(p, item, CROWDSEC_MAX_HEADER_VAL);
+
+        if (!v) {
+            return 0;
+        }
+        out->cookies[out->ncookies++] = v;
+    }
+    return 1;
+}
+
+static int parse_headers(yyjson_val *obj, apr_pool_t *p,
+                         crowdsec_appsec_verdict_t *out)
+{
+    yyjson_val *key, *val;
+    yyjson_obj_iter it;
+    apr_size_t cap;
+
+    if (!obj || yyjson_is_null(obj)) {
+        return 1;
+    }
+    if (!yyjson_is_obj(obj)) {
+        return 0;
+    }
+    if (yyjson_obj_size(obj) > CROWDSEC_MAX_HEADERS) {
+        return 0;
+    }
+    /* Each name may carry several values, and each becomes its own header. */
+    cap = yyjson_obj_size(obj) * CROWDSEC_MAX_HEADER_VALS;
+    out->headers = apr_pcalloc(p, (cap ? cap : 1) * sizeof(*out->headers));
+    if (!out->headers) {
+        return 0;
+    }
+
+    yyjson_obj_iter_init(obj, &it);
+    while ((key = yyjson_obj_iter_next(&it))) {
+        const char *name;
+        size_t nlen;
+
+        val = yyjson_obj_iter_get_val(key);
+        name = yyjson_get_str(key);
+        nlen = yyjson_get_len(key);
+        if (!name || !nlen || nlen > CROWDSEC_MAX_HEADER_NAME
+            || nlen != strlen(name) || !crowdsec_hdr_name_ok(name)) {
+            return 0;
+        }
+        if (header_denied(name)) {
+            continue;           /* dropped, not an error */
+        }
+        if (!strcasecmp(name, "content-type")) {
+            /* user_headers is map[string][]string, so a value is normally an
+             * array even when it holds one item. Accept a bare string too,
+             * since nothing in the protocol forbids it.
+             */
+            yyjson_val *first = val;
+
+            if (yyjson_is_arr(val)) {
+                if (yyjson_arr_size(val) != 1) {
+                    return 0;   /* two content types is not meaningful */
+                }
+                first = yyjson_arr_get_first(val);
+            }
+            out->content_type = dup_header_safe(p, first,
+                                                CROWDSEC_MAX_HEADER_VAL);
+            if (!out->content_type) {
+                return 0;
+            }
+            continue;
+        }
+        name = apr_pstrmemdup(p, name, nlen);
+
+        if (yyjson_is_str(val)) {
+            const char *v = dup_header_safe(p, val, CROWDSEC_MAX_HEADER_VAL);
+
+            if (!v) {
+                return 0;
+            }
+            out->headers[out->nheaders].name = name;
+            out->headers[out->nheaders].value = v;
+            out->nheaders++;
+        }
+        else if (yyjson_is_arr(val)) {
+            yyjson_val *item;
+            yyjson_arr_iter ait;
+
+            if (yyjson_arr_size(val) > CROWDSEC_MAX_HEADER_VALS) {
+                return 0;
+            }
+            yyjson_arr_iter_init(val, &ait);
+            while ((item = yyjson_arr_iter_next(&ait))) {
+                const char *v = dup_header_safe(p, item,
+                                                CROWDSEC_MAX_HEADER_VAL);
+
+                if (!v) {
+                    return 0;
+                }
+                out->headers[out->nheaders].name = name;
+                out->headers[out->nheaders].value = v;
+                out->nheaders++;
+            }
+        }
+        else {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int crowdsec_appsec_parse(const char *buf, apr_size_t len, apr_pool_t *p,
+                          crowdsec_appsec_verdict_t *out, const char **err)
+{
+    yyjson_doc *doc;
+    yyjson_val *root, *v;
+    const char *action;
+    int ok = 0;
+
+    if (!err) {
+        return 0;
+    }
+    *err = "internal";
+    if (!out || !p) {
+        return 0;
+    }
+    memset(out, 0, sizeof(*out));
+    out->rem = CROWDSEC_REM_UNKNOWN;
+
+    doc = parse_bounded(buf, len, p, err);
+    if (!doc) {
+        return 0;
+    }
+    root = yyjson_doc_get_root(doc);
+    if (!root || !yyjson_is_obj(root)) {
+        *err = "verdict root is not an object";
+        goto done;
+    }
+
+    action = str_field(root, "action");
+    if (!action) {
+        *err = "no action";
+        goto done;
+    }
+    out->action = apr_pstrdup(p, action);
+    out->rem = crowdsec_action_to_rem(action);
+
+    /* http_status is what the browser gets, and it is not the status we were
+     * given: a challenge that grants a cookie answers 307 with a Location.
+     */
+    v = yyjson_obj_get(root, "http_status");
+    if (!v || !yyjson_is_int(v)) {
+        *err = "no http_status";
+        goto done;
+    }
+    out->http_status = yyjson_get_int(v);
+    if (out->http_status < 100 || out->http_status > 599) {
+        *err = "http_status out of range";
+        goto done;
+    }
+
+    v = yyjson_obj_get(root, "user_body_content");
+    if (v && !yyjson_is_null(v)) {
+        const char *b;
+        size_t blen;
+
+        if (!yyjson_is_str(v)) {
+            *err = "user_body_content is not a string";
+            goto done;
+        }
+        b = yyjson_get_str(v);
+        blen = yyjson_get_len(v);
+        if (!b) {
+            *err = "user_body_content is unreadable";
+            goto done;
+        }
+        /* No NUL check here: this is a response body written by length, not a
+         * header, so an embedded NUL is data rather than an injection. The
+         * length is what matters.
+         */
+        out->body = apr_pmemdup(p, b, blen + 1);
+        if (!out->body) {
+            *err = "cannot copy the body";
+            goto done;
+        }
+        out->body_len = blen;
+    }
+
+    if (!parse_cookies(yyjson_obj_get(root, "user_cookies"), p, out)) {
+        *err = "user_cookies is unusable";
+        goto done;
+    }
+    if (!parse_headers(yyjson_obj_get(root, "user_headers"), p, out)) {
+        *err = "user_headers is unusable";
+        goto done;
+    }
+
+    ok = 1;
+    *err = NULL;
+
+done:
+    yyjson_doc_free(doc);
+
+    return ok;
+}

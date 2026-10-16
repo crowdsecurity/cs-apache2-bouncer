@@ -22,6 +22,7 @@ harness_init() {
 harness_cleanup() {
     [ -n "${APACHE_PID:-}" ] && kill "$APACHE_PID" 2>/dev/null
     [ -n "${LAPI_PID:-}" ] && kill "$LAPI_PID" 2>/dev/null
+    [ -n "${APPSEC_PID:-}" ] && kill "$APPSEC_PID" 2>/dev/null
     # apache forks children; the pidfile is the reliable handle
     [ -f "$HARNESS_DIR/run/httpd.pid" ] && kill "$(cat "$HARNESS_DIR/run/httpd.pid")" 2>/dev/null
     wait 2>/dev/null
@@ -69,6 +70,44 @@ lapi_api_start() {
         "$LAPI_PORT" "$LAPI_STATE" &
     LAPI_PID=$!
     harness_wait_port "$LAPI_PORT"
+}
+
+# Stub AppSec component. See test/lib/stub_appsec.py.
+appsec_start() {
+    APPSEC_PORT="$(harness_free_port)"
+    APPSEC_STATE="$HARNESS_DIR/appsec-state.json"
+    echo '{"action":"allow","http_status":200}' > "$APPSEC_STATE"
+    python3 "$(dirname "${BASH_SOURCE[0]}")/stub_appsec.py" \
+        "$APPSEC_PORT" "$APPSEC_STATE" &
+    APPSEC_PID=$!
+    harness_wait_port "$APPSEC_PORT"
+}
+
+appsec_set() { echo "$1" > "$APPSEC_STATE"; }
+
+# appsec_seen <field>   what the module actually forwarded
+appsec_seen() {
+    python3 -c 'import json,sys
+d=json.load(open(sys.argv[1])).get("seen") or {}
+v=d.get(sys.argv[2])
+print("" if v is None else v)' "$APPSEC_STATE" "$1"
+}
+
+appsec_calls() {
+    python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("calls",0))' \
+        "$APPSEC_STATE"
+}
+
+# appsec_has_header <name>  / appsec_header <name>
+appsec_has_header() {
+    python3 -c 'import json,sys
+d=json.load(open(sys.argv[1])).get("seen") or {}
+print("yes" if sys.argv[2].lower() in (d.get("headers") or {}) else "no")'         "$APPSEC_STATE" "$1"
+}
+appsec_header() {
+    python3 -c 'import json,sys
+d=json.load(open(sys.argv[1])).get("seen") or {}
+print((d.get("headers") or {}).get(sys.argv[2].lower(),""))'         "$APPSEC_STATE" "$1"
 }
 
 # lapi_set <json>   replace the whole state
@@ -154,6 +193,9 @@ apache_start() {
     local extra="$1"
     cat > "$HARNESS_DIR/httpd.conf" <<CONF
 ServerRoot "$HARNESS_DIR"
+# mod_cgid and the file-based mutexes put their sockets here; without it they
+# try /var/run/apache2 and fail for a non-root instance.
+DefaultRuntimeDir "$HARNESS_DIR/run"
 ServerName localhost
 PidFile "$HARNESS_DIR/run/httpd.pid"
 Listen 127.0.0.1:$APACHE_PORT

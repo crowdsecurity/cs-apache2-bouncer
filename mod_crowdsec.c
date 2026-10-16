@@ -81,6 +81,7 @@
 
 #include "apr_strings.h"
 
+#include "crowdsec_appsec.h"
 #include "crowdsec_http.h"
 #include "crowdsec_lapi.h"
 #include "crowdsec_util.h"
@@ -250,15 +251,41 @@ static int decided_earlier(request_rec *r)
     return 0;
 }
 
+/* Resolved at the point of use, so an unset parent scope is not mistaken for
+ * one that chose the default explicitly.
+ */
+static crowdsec_rem_t remediation_fallback(crowdsec_config_rec *conf)
+{
+    return conf->remediation_fallback_set ? conf->remediation_fallback
+        : CROWDSEC_REM_BAN;
+}
+
+static int appsec_failure(request_rec *r, crowdsec_config_rec *conf,
+                          crowdsec_rem_t *rem)
+{
+    if (conf->appsec_failure_action_set
+        && conf->appsec_failure_action == CROWDSEC_APPSEC_DENY) {
+        *rem = crowdsec_rem_merge(*rem, CROWDSEC_REM_BAN);
+        return 1;
+    }
+    /* Fail open. This is an availability choice, not a security one: an
+     * attacker who can degrade the engine buys themselves a window with no
+     * inspection, which is what CrowdsecAppsecFailureAction deny is for.
+     */
+    return 0;
+}
+
 static int crowdsec_check_access(request_rec *r)
 {
     crowdsec_config_rec *conf = ap_get_module_config(r->per_dir_config,
                                                      &crowdsec_module);
     crowdsec_server_rec *sconf = ap_get_module_config(r->server->module_config,
                                                       &crowdsec_module);
+    crowdsec_req_rec *st;
     crowdsec_rem_t rem = CROWDSEC_REM_ALLOW;
     crowdsec_lookup_t lr;
     const char *ip;
+    int appsec_on, challenge_path = 0;
 
     /* A subrequest is covered by the main request. */
     if (r->main) {
@@ -269,11 +296,15 @@ static int crowdsec_check_access(request_rec *r)
      * arrives here with r->prev set and nothing checked, so declining on
      * r->prev alone would hand the target over unchecked. An ErrorDocument
      * follows a request we did decide, so it still short-circuits here.
+     *
+     * The body is gone by this point, though: the original request consumed
+     * it. A redirect that does reach the checks below therefore inspects
+     * headers only - see the body handling in crowdsec_appsec_check.
      */
     if (r->prev && decided_earlier(r)) {
         return DECLINED;
     }
-    if (!conf->enable || !sconf || !sconf->url) {
+    if (!sconf) {
         return DECLINED;
     }
     /* A forward-proxy request is a different threat model and r->unparsed_uri
@@ -286,6 +317,41 @@ static int crowdsec_check_access(request_rec *r)
     if (r->proxyreq == PROXYREQ_PROXY || r->method_number == M_CONNECT) {
         return DECLINED;
     }
+
+    appsec_on = conf->appsec_enable_set && conf->appsec_enable;
+
+    /* The challenge's own assets and its submit endpoint live outside whatever
+     * <Location> enabled appsec, so without this the engine would never be
+     * consulted for them, the origin would 404, and a challenged visitor would
+     * be stuck for good - not blocked, not allowed. This is the one place the
+     * module deliberately overrides a per-directory off.
+     *
+     * Matched on r->uri, which Apache has already decoded and collapsed, so a
+     * traversal cannot slip past; the engine is still sent r->unparsed_uri,
+     * because it routes on that and its rules need the raw form.
+     */
+    if (sconf->appsec_url
+        && crowdsec_is_challenge_path(r->uri,
+                                      sconf->appsec_internal_path
+                                      ? sconf->appsec_internal_path
+                                      : CROWDSEC_APPSEC_INTERNAL_DEFAULT)) {
+        appsec_on = 1;
+        challenge_path = 1;
+    }
+
+    if (!conf->enable && !appsec_on) {
+        return DECLINED;
+    }
+    if (appsec_on && !sconf->appsec_url) {
+        appsec_on = 0;
+    }
+
+    /* Past the enable gate, so this request really is being decided - by the
+     * local API, by AppSec, or by the fallback below. Marking any earlier
+     * would let a "Crowdsec off" scope claim a verdict it never reached, and
+     * an internal redirect out of it would inherit that and skip its own
+     * check.
+     */
     apr_table_setn(r->notes, CROWDSEC_NOTE_DECIDED, "1");
 
     ip = crowdsec_client_ip(r, conf);
@@ -293,22 +359,109 @@ static int crowdsec_check_access(request_rec *r)
         return crowdsec_fallback(r, conf, "no client address");
     }
 
-    lr = crowdsec_lapi_lookup(r, sconf, ip, &rem);
+    st = apr_pcalloc(r->pool, sizeof(*st));
+    st->r = r;
+    ap_set_module_config(r->request_config, &crowdsec_module, st);
 
-    switch (lr) {
-    case CROWDSEC_LOOKUP_OK:
-        return crowdsec_apply(r, conf, rem, ip);
-    case CROWDSEC_LOOKUP_UNPRIMED:
-        /* Stream mode, before the first pull has finished. Every address
-         * looks clean here, which is a real if brief window, so it is the
-         * admin's CrowdsecFallback choice rather than an implicit allow.
-         */
-        return crowdsec_fallback(r, conf,
-                                 "the decision stream has not been loaded yet");
-    case CROWDSEC_LOOKUP_FAIL:
-    default:
-        return crowdsec_fallback(r, conf, "could not query crowdsec");
+    /* 1. The local API's view, from the stream cache or a live query. */
+    if (conf->enable && sconf->url) {
+        lr = crowdsec_lapi_lookup(r, sconf, ip, &rem);
+        if (lr == CROWDSEC_LOOKUP_UNPRIMED) {
+            return crowdsec_fallback(r, conf,
+                                     "the decision stream has not been "
+                                     "loaded yet");
+        }
+        if (lr != CROWDSEC_LOOKUP_OK) {
+            return crowdsec_fallback(r, conf, "could not query crowdsec");
+        }
     }
+
+    /* 2. Inspection, unless the verdict is already as restrictive as it can
+     * get. Nothing is gained by inspecting a request that is already banned.
+     */
+    if (appsec_on
+        && (rem < CROWDSEC_REM_BAN
+            || (conf->appsec_always_send_set && conf->appsec_always_send))) {
+        switch (crowdsec_appsec_check(r, sconf, conf, st, ip)) {
+        case CROWDSEC_APPSEC_OK:
+            rem = crowdsec_rem_merge(rem,
+                                     crowdsec_action_to_rem(st->verdict.action
+                                                            ? st->verdict.action
+                                                            : ""));
+            /* A parse failure on a 403 sets the remediation directly. */
+            if (st->verdict.rem > rem) {
+                rem = st->verdict.rem;
+            }
+            break;
+        case CROWDSEC_APPSEC_DROP:
+            rem = crowdsec_rem_merge(rem, CROWDSEC_REM_BAN);
+            break;
+        case CROWDSEC_APPSEC_BADREQ:
+            return HTTP_BAD_REQUEST;
+        case CROWDSEC_APPSEC_FAIL:
+        default:
+            appsec_failure(r, conf, &rem);
+            break;
+        }
+    }
+
+    /* 3. Apply. */
+    if (rem == CROWDSEC_REM_UNKNOWN || rem == CROWDSEC_REM_CAPTCHA) {
+        if (rem == CROWDSEC_REM_CAPTCHA) {
+            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                          "crowdsec: a captcha was requested for '%s' but "
+                          "this component cannot serve one; applying "
+                          "CrowdsecRemediationFallback", ip);
+        }
+        else {
+            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                          "crowdsec: unrecognised remediation '%s' for '%s'; "
+                          "applying CrowdsecRemediationFallback",
+                          st->verdict.action ? st->verdict.action : "?", ip);
+        }
+        rem = remediation_fallback(conf);
+    }
+
+    if (rem == CROWDSEC_REM_CHALLENGE) {
+        int rv;
+
+        /* Only the engine can produce a challenge, because only it has the
+         * page and the sealed cookie. A challenge arriving any other way - a
+         * blocklist, or a local decision - has no body to serve, so it has to
+         * fail closed.
+         */
+        rv = crowdsec_appsec_serve(r, &st->verdict);
+        if (rv == DONE) {
+            apr_table_setn(r->subprocess_env, "CROWDSEC_STATUS", "challenge");
+            return DONE;
+        }
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "crowdsec: a challenge was required for '%s' but could "
+                      "not be served; blocking instead", ip);
+        rem = CROWDSEC_REM_BAN;
+    }
+
+    if (rem >= CROWDSEC_REM_BAN) {
+        return crowdsec_apply(r, conf, rem, ip);
+    }
+
+    /* Allowed. A challenge asset must never reach the origin even so: the
+     * engine answers those itself and the origin has nothing to serve.
+     */
+    if (challenge_path) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "crowdsec: '%s' is a challenge endpoint but the engine "
+                      "did not answer it; refusing rather than passing it to "
+                      "the origin", r->uri);
+        return HTTP_NOT_FOUND;
+    }
+
+    /* The body was consumed to inspect it, so put it back for the real
+     * handler. Only here: on any other path the request does not proceed.
+     */
+    crowdsec_appsec_replay(r, st);
+
+    return crowdsec_apply(r, conf, rem, ip);
 }
 
 /* ------------------------------------------------------- status handler */
@@ -418,7 +571,23 @@ static int crowdsec_post_config(apr_pool_t *pconf, apr_pool_t *plog,
             }
         }
 
-        if (!sconf->url) {
+        /* AppSec authenticates with the same bouncer key as the local API,
+         * so there is one directive for both.
+         */
+        if (!sconf->appsec_key) {
+            sconf->appsec_key = sconf->key;
+        }
+        if (sconf->appsec_url && !sconf->appsec_key) {
+            /* The engine answers 401 without a key, which would make every
+             * request take the failure action. Say so now instead.
+             */
+            ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
+                         "crowdsec: CrowdsecAppsecURL is set but "
+                         "CrowdsecAPIKey is not; AppSec cannot authenticate");
+            return 500;
+        }
+
+        if (!sconf->url && !sconf->appsec_url) {
             continue;
         }
 
@@ -543,6 +712,7 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_child_init(crowdsec_child_init, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_handler(crowdsec_status_handler, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_access_checker(crowdsec_check_access, NULL, NULL, APR_HOOK_FIRST);
+    crowdsec_appsec_register(p);
 }
 
 /* ------------------------------------------------------------ config */
@@ -572,6 +742,11 @@ static void *merge_crowdsec_dir_config(apr_pool_t *p, void *basev, void *addv)
     MERGE(blockedhttpcode);
     MERGE(remediation_fallback);
     MERGE(trust_useragent_ip);
+    MERGE(appsec_enable);
+    MERGE(appsec_always_send);
+    MERGE(appsec_failure_action);
+    MERGE(appsec_body_limit);
+    MERGE(appsec_body_limit_action);
 
     return new;
 }
@@ -585,6 +760,10 @@ static void *create_crowdsec_server_config(apr_pool_t *p, server_rec *s)
     conf->connect_timeout = CROWDSEC_CONNECT_TIMEOUT_DEFAULT;
     conf->timeout = CROWDSEC_TIMEOUT_DEFAULT;
     conf->mode = CROWDSEC_MODE_LIVE;
+    conf->appsec_path = CROWDSEC_APPSEC_PATH_DEFAULT;
+    conf->appsec_internal_path = CROWDSEC_APPSEC_INTERNAL_DEFAULT;
+    conf->appsec_connect_timeout = CROWDSEC_APPSEC_CONNECT_TIMEOUT_DEFAULT;
+    conf->appsec_timeout = CROWDSEC_APPSEC_TIMEOUT_DEFAULT;
 
     return conf;
 }
@@ -603,6 +782,17 @@ static void *merge_crowdsec_server_config(apr_pool_t *p, void *basev,
     MERGE(connect_timeout);
     MERGE(timeout);
     MERGE(cache_timeout);
+    MERGE(appsec_path);
+    MERGE(appsec_connect_timeout);
+    MERGE(appsec_timeout);
+    MERGE(appsec_internal_path);
+
+    /* appsec_socket is derived from appsec_url, so they move together. */
+    new->appsec_url = (add->appsec_url_set == 0)
+        ? base->appsec_url : add->appsec_url;
+    new->appsec_socket = (add->appsec_url_set == 0)
+        ? base->appsec_socket : add->appsec_socket;
+    new->appsec_url_set = add->appsec_url_set || base->appsec_url_set;
 
     /* provider and instance travel together. */
     new->cache_provider = (add->cache_provider_set == 0)
@@ -918,6 +1108,205 @@ static const char *set_crowdsec_cache_timeout(cmd_parms *cmd, void *dconf,
     return NULL;
 }
 
+static const char *set_crowdsec_appsec(cmd_parms *cmd, void *dconf, int flag)
+{
+    crowdsec_config_rec *conf = dconf;
+
+    conf->appsec_enable = flag;
+    conf->appsec_enable_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_appsec_always_send(cmd_parms *cmd, void *dconf,
+                                                   int flag)
+{
+    crowdsec_config_rec *conf = dconf;
+
+    conf->appsec_always_send = flag;
+    conf->appsec_always_send_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_appsec_failure_action(cmd_parms *cmd,
+                                                      void *dconf,
+                                                      const char *arg)
+{
+    crowdsec_config_rec *conf = dconf;
+
+    if (!strcmp(arg, "passthrough")) {
+        conf->appsec_failure_action = CROWDSEC_APPSEC_PASSTHROUGH;
+    }
+    else if (!strcmp(arg, "deny")) {
+        conf->appsec_failure_action = CROWDSEC_APPSEC_DENY;
+    }
+    else {
+        return apr_psprintf(cmd->pool, "Unknown CrowdsecAppsecFailureAction "
+                            "'%s'. Valid values are passthrough and deny.",
+                            arg);
+    }
+    conf->appsec_failure_action_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_appsec_body_limit(cmd_parms *cmd, void *dconf,
+                                                  const char *arg)
+{
+    crowdsec_config_rec *conf = dconf;
+
+    if (!crowdsec_parse_size(arg, &conf->appsec_body_limit)) {
+        return apr_psprintf(cmd->pool, "CrowdsecAppsecBodyLimit '%s' is not a "
+                            "valid size. Use e.g. 1m, 512k or a byte count.",
+                            arg);
+    }
+    conf->appsec_body_limit_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_appsec_body_limit_action(cmd_parms *cmd,
+                                                         void *dconf,
+                                                         const char *arg)
+{
+    crowdsec_config_rec *conf = dconf;
+
+    if (!strcmp(arg, "drop")) {
+        conf->appsec_body_limit_action = CROWDSEC_CAP_DROP;
+    }
+    else if (!strcmp(arg, "bypass")) {
+        conf->appsec_body_limit_action = CROWDSEC_CAP_BYPASS;
+    }
+    else {
+        return apr_psprintf(cmd->pool, "Unknown "
+                            "CrowdsecAppsecBodyLimitAction '%s'. Valid values "
+                            "are drop and bypass.", arg);
+    }
+    conf->appsec_body_limit_action_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_appsec_url(cmd_parms *cmd, void *dconf,
+                                           const char *arg)
+{
+    crowdsec_server_rec *sconf =
+        ap_get_module_config(cmd->server->module_config, &crowdsec_module);
+    apr_size_t len;
+
+    if (!*arg) {
+        return "CrowdsecAppsecURL must not be empty.";
+    }
+
+    /* unix:/path/to.sock addresses the socket the engine's listen_socket
+     * creates. libcurl still needs a URL for the request line, so a
+     * placeholder host is used and the socket carries the connection.
+     */
+    if (!strncmp(arg, "unix:", 5)) {
+        if (!arg[5]) {
+            return "CrowdsecAppsecURL unix: needs a socket path.";
+        }
+        sconf->appsec_socket = apr_pstrdup(cmd->pool, arg + 5);
+        sconf->appsec_url = "http://localhost";
+    }
+    else {
+        if (strncmp(arg, "http://", 7) && strncmp(arg, "https://", 8)) {
+            return "CrowdsecAppsecURL must begin with http://, https:// or "
+                "unix:.";
+        }
+        /* A trailing slash here plus the leading one in CrowdsecAppsecPath
+         * would make a double slash, which the engine answers with 404.
+         */
+        len = strlen(arg);
+        while (len > 1 && arg[len - 1] == '/') {
+            len--;
+        }
+        sconf->appsec_url = apr_pstrmemdup(cmd->pool, arg, len);
+    }
+    sconf->appsec_url_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_appsec_path(cmd_parms *cmd, void *dconf,
+                                            const char *arg)
+{
+    crowdsec_server_rec *sconf =
+        ap_get_module_config(cmd->server->module_config, &crowdsec_module);
+
+    if (arg[0] != '/') {
+        return "CrowdsecAppsecPath must begin with a slash.";
+    }
+    if (!crowdsec_target_ok(arg)) {
+        return "CrowdsecAppsecPath contains characters that cannot appear in "
+            "a request target.";
+    }
+    sconf->appsec_path = arg;
+    sconf->appsec_path_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_appsec_internal_path(cmd_parms *cmd,
+                                                     void *dconf,
+                                                     const char *arg)
+{
+    crowdsec_server_rec *sconf =
+        ap_get_module_config(cmd->server->module_config, &crowdsec_module);
+    apr_size_t len = strlen(arg);
+
+    if (arg[0] != '/' || len < 2) {
+        return "CrowdsecAppsecInternalPath must be an absolute path.";
+    }
+    if (arg[len - 1] != '/') {
+        return "CrowdsecAppsecInternalPath must end with a slash.";
+    }
+    if (!crowdsec_target_ok(arg)) {
+        return "CrowdsecAppsecInternalPath contains characters that cannot "
+            "appear in a request target.";
+    }
+    sconf->appsec_internal_path = arg;
+    sconf->appsec_internal_path_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_appsec_connect_timeout(cmd_parms *cmd,
+                                                       void *dconf,
+                                                       const char *arg)
+{
+    crowdsec_server_rec *sconf =
+        ap_get_module_config(cmd->server->module_config, &crowdsec_module);
+    const char *err = parse_interval(cmd, arg, "CrowdsecAppsecConnectTimeout",
+                                     apr_time_from_sec(60),
+                                     &sconf->appsec_connect_timeout);
+
+    if (err) {
+        return err;
+    }
+    sconf->appsec_connect_timeout_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_appsec_timeout(cmd_parms *cmd, void *dconf,
+                                               const char *arg)
+{
+    crowdsec_server_rec *sconf =
+        ap_get_module_config(cmd->server->module_config, &crowdsec_module);
+    const char *err = parse_interval(cmd, arg, "CrowdsecAppsecTimeout",
+                                     apr_time_from_sec(60),
+                                     &sconf->appsec_timeout);
+
+    if (err) {
+        return err;
+    }
+    sconf->appsec_timeout_set = 1;
+
+    return NULL;
+}
+
 static const command_rec crowdsec_cmds[] = {
     AP_INIT_FLAG("Crowdsec", set_crowdsec, NULL, RSRC_CONF | ACCESS_CONF,
                  "Check requests in this scope against crowdsec. Default off."),
@@ -977,6 +1366,62 @@ static const command_rec crowdsec_cmds[] = {
                   RSRC_CONF,
                   "How long one address's verdict is remembered in-process. "
                   "Default 60s."),
+    AP_INIT_TAKE1("CrowdsecAppsecURL", set_crowdsec_appsec_url, NULL,
+                  RSRC_CONF,
+                  "Address of the AppSec component, e.g. "
+                  "http://127.0.0.1:7422 or unix:/run/crowdsec/appsec.sock. "
+                  "Unset disables AppSec."),
+    AP_INIT_TAKE1("CrowdsecAppsecPath", set_crowdsec_appsec_path, NULL,
+                  RSRC_CONF,
+                  "Path the AppSec component listens on, matching the "
+                  "datasource's path setting. Default /. A 404 from AppSec "
+                  "usually means this does not match."),
+    AP_INIT_TAKE1("CrowdsecAppsecInternalPath",
+                  set_crowdsec_appsec_internal_path, NULL, RSRC_CONF,
+                  "Prefix the bot-detection challenge serves its own assets "
+                  "and submissions from. Default "
+                  "/crowdsec-internal/challenge/. These are always sent to "
+                  "AppSec and never to the origin, even where Crowdsec is "
+                  "otherwise off, because a challenged visitor cannot "
+                  "complete without them."),
+    AP_INIT_TAKE1("CrowdsecAppsecConnectTimeout",
+                  set_crowdsec_appsec_connect_timeout, NULL, RSRC_CONF,
+                  "How long to wait for a connection to AppSec. Default "
+                  "200ms."),
+    AP_INIT_TAKE1("CrowdsecAppsecTimeout", set_crowdsec_appsec_timeout, NULL,
+                  RSRC_CONF,
+                  "Total budget for one AppSec request, excluding the time "
+                  "spent reading the client's body. Default 1s."),
+    AP_INIT_FLAG("CrowdsecAppsec", set_crowdsec_appsec, NULL,
+                 RSRC_CONF | ACCESS_CONF,
+                 "Send requests in this scope to AppSec for inspection. "
+                 "Default off."),
+    AP_INIT_FLAG("CrowdsecAppsecAlwaysSend",
+                 set_crowdsec_appsec_always_send, NULL,
+                 RSRC_CONF | ACCESS_CONF,
+                 "Inspect even when the client is already blocked. Default "
+                 "off, since nothing is gained by inspecting a request that "
+                 "will be refused anyway."),
+    AP_INIT_TAKE1("CrowdsecAppsecFailureAction",
+                  set_crowdsec_appsec_failure_action, NULL,
+                  RSRC_CONF | ACCESS_CONF,
+                  "What to do when AppSec cannot be consulted: passthrough or "
+                  "deny. Default passthrough. This is an availability choice, "
+                  "not a security one - an attacker who can degrade AppSec "
+                  "gains a window with no inspection."),
+    AP_INIT_TAKE1("CrowdsecAppsecBodyLimit", set_crowdsec_appsec_body_limit,
+                  NULL, RSRC_CONF | ACCESS_CONF,
+                  "How much request body to forward for inspection. Default "
+                  "1m; 0 forwards none, leaving the WAF blind to anything "
+                  "carried in a body. The limit is buffered per request in "
+                  "flight, so the worst case is this times MaxRequestWorkers."),
+    AP_INIT_TAKE1("CrowdsecAppsecBodyLimitAction",
+                  set_crowdsec_appsec_body_limit_action, NULL,
+                  RSRC_CONF | ACCESS_CONF,
+                  "What to do with a body over the limit: drop (default) "
+                  "blocks the request; bypass lets it through UNINSPECTED, "
+                  "which is a WAF bypass anyone can trigger by padding a "
+                  "request body."),
     {NULL}
 };
 

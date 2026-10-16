@@ -37,6 +37,9 @@ for the stub API and port probing.
 | `live-mode.bats` | per-request queries, the shared verdict cache, and every `CrowdsecFallback` value |
 | `stream-mode.bats` | background polling, ranges, deletion, expiry, the unprimed window |
 | `limits.bats` | cache too small, 100000 decisions, IPv6, many prefix lengths, malformed input, leader takeover |
+| `appsec.bats` | what is forwarded for inspection, each verdict, failure handling |
+| `challenge.bats` | relaying the interstitial, cookies, headers, the internal endpoints, failing closed |
+| `appsec-body.bats` | body inspection and replay, the limit, drop vs bypass, chunked, gzip, LimitRequestBody |
 
 Both MPMs are covered; `HARNESS_MPM=event` switches, and tests needing several
 child processes use `mpm_many_children` so the directives are spelled correctly
@@ -64,6 +67,15 @@ cscli decisions add --range 127.0.0.0/24 --duration 10m
 A run against a live engine holding 145000 real decisions confirmed the stream
 protocol, range matching, deletion within one poll, and the 16MB sizing figure
 above.
+
+For AppSec, point `CrowdsecAppsecURL` at a real appsec datasource. With the
+`crowdsecurity/appsec-bot-challenge` collection installed, a plain `curl` to a
+challenged path gets the real interstitial — around 318KB — and
+`/crowdsec-internal/challenge/pow-worker.js` and `fpscanner.js` are served from
+the engine. Two things cannot be checked without a browser that can compute the
+proof of work: the cookie the engine mints on a successful submission, and the
+request that follows it. Those are covered against the stub, where a solve can
+be simulated.
 
 ## Unit tests
 

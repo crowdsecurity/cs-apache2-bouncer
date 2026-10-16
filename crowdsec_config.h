@@ -31,6 +31,16 @@
  */
 #define CROWDSEC_CEILING_LIVE    (1 * 1024 * 1024)
 #define CROWDSEC_CEILING_STREAM  (256 * 1024 * 1024)
+/* A challenge page with its inlined detection bundle measures a few hundred
+ * kilobytes, so this is two orders of magnitude of headroom.
+ */
+#define CROWDSEC_CEILING_APPSEC  (32 * 1024 * 1024)
+
+#define CROWDSEC_APPSEC_CONNECT_TIMEOUT_DEFAULT apr_time_from_msec(200)
+#define CROWDSEC_APPSEC_TIMEOUT_DEFAULT         apr_time_from_sec(1)
+#define CROWDSEC_APPSEC_PATH_DEFAULT            "/"
+#define CROWDSEC_APPSEC_INTERNAL_DEFAULT        "/crowdsec-internal/challenge/"
+#define CROWDSEC_BODY_LIMIT_DEFAULT             (1024 * 1024)
 
 /* Fixed-size, direct-mapped per-child verdict cache. Fixed so there is no
  * eviction policy to get wrong and no allocation after child_init; a collision
@@ -44,6 +54,22 @@ typedef enum
     CROWDSEC_MODE_LIVE = 0,
     CROWDSEC_MODE_STREAM
 } crowdsec_mode_t;
+
+/* What an oversized request body does. drop blocks it; bypass lets it past
+ * uninspected, which is a WAF bypass an attacker can trigger at will by
+ * padding, hence the default and the warnings.
+ */
+typedef enum
+{
+    CROWDSEC_CAP_DROP = 0,
+    CROWDSEC_CAP_BYPASS
+} crowdsec_cap_t;
+
+typedef enum
+{
+    CROWDSEC_APPSEC_PASSTHROUGH = 0,
+    CROWDSEC_APPSEC_DENY
+} crowdsec_appsec_fail_t;
 
 typedef enum
 {
@@ -84,6 +110,15 @@ typedef struct
     apr_interval_time_t timeout;
     apr_interval_time_t cache_timeout;
 
+    /* appsec endpoint */
+    const char *appsec_url;
+    const char *appsec_socket;  /* set when appsec_url was unix:... */
+    const char *appsec_path;
+    const char *appsec_key;     /* same bouncer key as the local API */
+    apr_interval_time_t appsec_connect_timeout;
+    apr_interval_time_t appsec_timeout;
+    const char *appsec_internal_path;
+
     /* shared decision cache. cache_owned marks the one server_rec whose own
      * CrowdsecCache created the instance; vhosts that merely inherit it share
      * the same instance pointer and must not initialise or destroy it again.
@@ -120,6 +155,11 @@ typedef struct
     unsigned int timeout_set:1;
     unsigned int cache_provider_set:1;
     unsigned int cache_timeout_set:1;
+    unsigned int appsec_url_set:1;
+    unsigned int appsec_path_set:1;
+    unsigned int appsec_connect_timeout_set:1;
+    unsigned int appsec_timeout_set:1;
+    unsigned int appsec_internal_path_set:1;
 } crowdsec_server_rec;
 
 typedef struct
@@ -131,12 +171,23 @@ typedef struct
     crowdsec_rem_t remediation_fallback;
     unsigned int trust_useragent_ip:1;
 
+    unsigned int appsec_enable:1;
+    unsigned int appsec_always_send:1;
+    crowdsec_appsec_fail_t appsec_failure_action:2;
+    crowdsec_cap_t appsec_body_limit_action:2;
+    apr_off_t appsec_body_limit;
+
     unsigned int enable_set:1;
     unsigned int fallback_set:1;
     unsigned int location_set:1;
     unsigned int blockedhttpcode_set:1;
     unsigned int remediation_fallback_set:1;
     unsigned int trust_useragent_ip_set:1;
+    unsigned int appsec_enable_set:1;
+    unsigned int appsec_always_send_set:1;
+    unsigned int appsec_failure_action_set:1;
+    unsigned int appsec_body_limit_set:1;
+    unsigned int appsec_body_limit_action_set:1;
 } crowdsec_config_rec;
 
 extern module AP_MODULE_DECLARE_DATA crowdsec_module;

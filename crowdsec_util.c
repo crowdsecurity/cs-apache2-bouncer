@@ -180,31 +180,6 @@ int crowdsec_parse_size(const char *s, apr_off_t *out)
     return 1;
 }
 
-int crowdsec_body_take(apr_off_t used, apr_size_t chunk, apr_off_t cap,
-                       apr_size_t *take)
-{
-    apr_off_t room;
-
-    if (!take) {
-        return 0;
-    }
-    *take = 0;
-
-    if (used < 0 || cap < 0 || used >= cap) {
-        return 0;
-    }
-    /* Never used + chunk: that is the overflow. The comparison is unsigned
-     * because chunk is, and a value above the signed maximum would cast to a
-     * negative apr_off_t, compare below room, and hand back the whole chunk -
-     * defeating the cap this function exists to enforce.
-     */
-    room = cap - used;
-    *take = ((apr_uint64_t) chunk > (apr_uint64_t) room)
-        ? (apr_size_t) room : chunk;
-
-    return *take > 0;
-}
-
 static int parse_plen(const char *s, int max, int *out)
 {
     int v = 0;

@@ -94,17 +94,15 @@ crowdsec_http_err_t crowdsec_http_exchange(apr_reslist_t *handles,
  * client header can never inject a second header. Returns 0 and leaves *list
  * untouched if the name or value is unacceptable, or on allocation failure.
  *
- * *list must be freed with crowdsec_http_headers_free; registering that with
- * a pool cleanup is the only safe way to use this, because curl_slist_append
- * does not free the list it was handed when it fails.
+ * The only safe way to use this is to register crowdsec_http_headers_cleanup
+ * against the pool that owns *list, because curl_slist_append does not free
+ * the list it was handed when it fails - so an early return would leak it.
  */
 int crowdsec_http_header_add(apr_pool_t *p, struct curl_slist **list,
                              const char *name, const char *value);
 
 /* Append a literal line, for curl's own "Accept:" style suppressions. */
 int crowdsec_http_header_add_raw(struct curl_slist **list, const char *line);
-
-void crowdsec_http_headers_free(struct curl_slist *list);
 
 /* apr_pool_cleanup_register handler; data is a struct curl_slist ** */
 apr_status_t crowdsec_http_headers_cleanup(void *data);

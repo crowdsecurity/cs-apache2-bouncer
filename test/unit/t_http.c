@@ -51,7 +51,11 @@ static int selftest(apr_pool_t *p)
     CHECK(crowdsec_http_header_add_raw(&l, "Accept:"), "suppression line");
     CHECK(l != NULL, "accepted calls built a list");
 
-    crowdsec_http_headers_free(l);
+    /* The production path frees through this, registered as a pool cleanup,
+     * so the test uses it too rather than a helper nothing else calls.
+     */
+    crowdsec_http_headers_cleanup(&l);
+    CHECK(l == NULL, "cleanup cleared the caller's holder");
 
     if (failures) {
         printf("FAILED: %d\n", failures);

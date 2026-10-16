@@ -139,35 +139,6 @@ static void test_size(void)
     CHECK(crowdsec_parse_size(NULL, &v) == 0, "parse_size NULL in");
 }
 
-static void test_body_take(void)
-{
-    apr_size_t take;
-
-    CHECK(crowdsec_body_take(0, 100, 1000, &take) && take == 100, "room");
-    CHECK(crowdsec_body_take(950, 100, 1000, &take) && take == 50, "partial");
-    CHECK(!crowdsec_body_take(1000, 100, 1000, &take) && take == 0, "at cap");
-    CHECK(!crowdsec_body_take(1001, 100, 1000, &take) && take == 0, "over cap");
-    CHECK(!crowdsec_body_take(0, 100, 0, &take) && take == 0, "zero cap");
-    CHECK(!crowdsec_body_take(-1, 100, 1000, &take), "negative used");
-    CHECK(!crowdsec_body_take(0, 100, -1, &take), "negative cap");
-    CHECK(!crowdsec_body_take(0, 0, 1000, &take) && take == 0, "zero chunk");
-    /* The reason this helper exists: used+chunk overflows, cap-used does not */
-    CHECK(crowdsec_body_take(APR_INT64_C(0x7ffffffffffffff0), 100,
-                             APR_INT64_C(0x7ffffffffffffff8), &take)
-          && take == 8, "no overflow near max");
-    /* A chunk above the signed maximum must still be clamped to the cap: cast
-     * to apr_off_t it reads negative, so a signed compare hands back the lot.
-     */
-    if (sizeof(apr_size_t) >= 8) {
-        CHECK(crowdsec_body_take(0, (apr_size_t) APR_UINT64_C(0xfffffffffffffff0),
-                                 1000, &take) && take == 1000,
-              "chunk above the signed maximum is capped");
-        CHECK(crowdsec_body_take(0, (apr_size_t) APR_UINT64_C(0x8000000000000000),
-                                 1000, &take) && take == 1000,
-              "chunk at the signed boundary is capped");
-    }
-}
-
 static void test_duration(void)
 {
     apr_interval_time_t v;
@@ -403,7 +374,6 @@ int main(void)
     test_target();
     test_version();
     test_size();
-    test_body_take();
     test_duration();
     test_cidr();
     test_key_encode();

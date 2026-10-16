@@ -30,12 +30,6 @@ const char *crowdsec_http_version_hdr(int proto_num);
  */
 int crowdsec_parse_size(const char *s, apr_off_t *out);
 
-/* How much of a chunk still fits under cap. Written to avoid computing
- * used+chunk, which can overflow. Returns 1 while there is room.
- */
-int crowdsec_body_take(apr_off_t used, apr_size_t chunk, apr_off_t cap,
-                       apr_size_t *take);
-
 /* "10.0.0.0/24", "1.2.3.4", "2001:db8::/32", "::1". A bare address gets the
  * family's full prefix length. Rejects a prefix length outside the family's
  * range, so a malformed entry can never alias another network.

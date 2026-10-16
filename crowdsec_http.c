@@ -210,13 +210,6 @@ int crowdsec_http_header_add_raw(struct curl_slist **list, const char *line)
     return 1;
 }
 
-void crowdsec_http_headers_free(struct curl_slist *list)
-{
-    if (list) {
-        curl_slist_free_all(list);
-    }
-}
-
 apr_status_t crowdsec_http_headers_cleanup(void *data)
 {
     struct curl_slist **list = data;

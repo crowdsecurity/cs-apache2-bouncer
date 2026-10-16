@@ -86,3 +86,4 @@ debian/crowdsec-apache2-bouncer/
 /test/unit/t_util
 /test/unit/t_verdict
 /test/unit/t_http
+crowdsec_version.h

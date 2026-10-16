@@ -2,9 +2,9 @@
 # Process this file with autoconf to produce a configure script.
 
 AC_PREREQ(2.59)
-AC_INIT(mod_crowdsec, 0.0.1, minfrin@sharp.fm)
+AC_INIT(mod_crowdsec, 1.0.0, minfrin@sharp.fm)
 AM_INIT_AUTOMAKE([dist-bzip2 subdir-objects])
-AC_CONFIG_FILES([Makefile mod_crowdsec.spec])
+AC_CONFIG_FILES([Makefile mod_crowdsec.spec crowdsec_version.h])
 AC_CONFIG_SRCDIR([mod_crowdsec.c])
 AC_CONFIG_HEADERS([config.h])
 

@@ -353,6 +353,12 @@ crowdsec_http_err_t crowdsec_http_exchange(apr_reslist_t *handles,
      * entire budget without ever timing out. The window is the caller's
      * choice: see low_speed_time.
      */
+    /* Always assign: a pooled handle keeps the previous caller's value, and
+     * leaking our own User-Agent into an AppSec request would perturb the
+     * JA4H fingerprint the rule engine computes. NULL sends none.
+     */
+    curl_easy_setopt(h, CURLOPT_USERAGENT, req->user_agent);
+
     if (req->progress) {
         curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, xferinfo);
         curl_easy_setopt(h, CURLOPT_XFERINFODATA, (void *) req);

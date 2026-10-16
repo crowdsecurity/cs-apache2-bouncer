@@ -6,6 +6,15 @@
 #ifndef CROWDSEC_INTERNAL_H
 #define CROWDSEC_INTERNAL_H
 
+#include "crowdsec_version.h"
+
+/* How this bouncer identifies itself to the local API. The bouncer spec asks
+ * for "<name>/<version>", and it is what makes cscli bouncers list show a type
+ * and version instead of N/A. Not sent to AppSec: that request carries the
+ * client's own User-Agent, because the rule engine fingerprints it (JA4H).
+ */
+#define CROWDSEC_BOUNCER_UA "crowdsec-apache2-bouncer/" CROWDSEC_BOUNCER_VERSION
+
 #include "apr.h"
 #include "apr_errno.h"
 #include "apr_pools.h"

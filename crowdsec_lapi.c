@@ -602,6 +602,7 @@ static crowdsec_lookup_t live_query(request_rec *r,
     req.low_speed_time = apr_time_from_sec(1);
     req.ceiling = CROWDSEC_CEILING_LIVE;
     req.ssl_verify = 1;
+    req.user_agent = CROWDSEC_BOUNCER_UA;
     req.headers = *hdrs;
 
     errbuf[0] = '\0';
@@ -858,6 +859,7 @@ static apr_status_t do_pull(server_rec *s, crowdsec_server_rec *sconf,
     req.low_speed_time = full ? apr_time_from_sec(30) : apr_time_from_sec(10);
     req.ceiling = CROWDSEC_CEILING_STREAM;
     req.ssl_verify = 1;
+    req.user_agent = CROWDSEC_BOUNCER_UA;
     req.headers = *hdrs;
 
     hb.sconf = sconf;

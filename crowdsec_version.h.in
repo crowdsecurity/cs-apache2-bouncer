@@ -1,0 +1,11 @@
+/* Generated from crowdsec_version.h.in by configure. Do not edit.
+ *
+ * A dedicated header rather than config.h: httpd's ap_config_auto.h defines
+ * its own PACKAGE_* macros, so including ours would collide.
+ */
+#ifndef CROWDSEC_VERSION_H
+#define CROWDSEC_VERSION_H
+
+#define CROWDSEC_BOUNCER_VERSION "@PACKAGE_VERSION@"
+
+#endif /* CROWDSEC_VERSION_H */

@@ -60,6 +60,10 @@ typedef struct
      */
     int (*progress)(void *data);
     void *progress_data;
+    /* Sent as User-Agent when set. Per request, not per handle: handles are
+     * pooled and AppSec must keep relaying the client's own User-Agent.
+     */
+    const char *user_agent;
 } crowdsec_http_req_t;
 
 /* Once per child, before any other call here. Returns APR_SUCCESS or logs

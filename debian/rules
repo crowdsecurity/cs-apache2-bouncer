@@ -66,6 +66,11 @@ binary-arch: build install
 # don't compress examples
 	dh_compress -a -Xexample
 	dh_fixperms -a
+# The config holds the bouncer's API key, so it must not be world-readable.
+# dh_fixperms would otherwise leave it 0644, and the runtime writer in
+# scripts/_bouncer.sh uses a plain redirect, which preserves whatever mode the
+# file already has rather than imposing one.
+	chmod 0600 debian/crowdsec-apache2-bouncer/etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf
 #	chown www-data debian/libapache2-mod-security2/var/cache/modsecurity
 #	dh_makeshlibs -a
 	dh_installdeb -a

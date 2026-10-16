@@ -190,6 +190,17 @@ typedef struct
     unsigned int appsec_body_limit_action_set:1;
 } crowdsec_config_rec;
 
+/* Implemented in crowdsec_config.c. Declared here because the module struct in
+ * mod_crowdsec.c is the only consumer, and these travel with the structures
+ * above rather than with request handling.
+ */
+void *create_crowdsec_dir_config(apr_pool_t *p, char *d);
+void *merge_crowdsec_dir_config(apr_pool_t *p, void *basev, void *addv);
+void *create_crowdsec_server_config(apr_pool_t *p, server_rec *s);
+void *merge_crowdsec_server_config(apr_pool_t *p, void *basev, void *addv);
+
+extern const command_rec crowdsec_cmds[];
+
 extern module AP_MODULE_DECLARE_DATA crowdsec_module;
 
 /* The address we treat as the client, honouring CrowdsecTrustUseragentIP. */

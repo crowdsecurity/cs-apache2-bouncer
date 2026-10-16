@@ -9,11 +9,12 @@ YYJSON_DEFS = -DYYJSON_READER_DEPTH_LIMIT=8 \
               -DYYJSON_DISABLE_UTILS=1
 
 CROWDSEC_HDRS = crowdsec_internal.h crowdsec_config.h crowdsec_util.h \
-                crowdsec_http.h crowdsec_lapi.h crowdsec_verdict.h crowdsec_appsec.h \
+                crowdsec_http.h crowdsec_lapi.h crowdsec_store.h crowdsec_verdict.h \
+                crowdsec_appsec.h \
                 crowdsec_poison.h
 
-CROWDSEC_SRC = mod_crowdsec.c crowdsec_util.c crowdsec_http.c \
-               crowdsec_lapi.c crowdsec_verdict.c crowdsec_appsec.c
+CROWDSEC_SRC = mod_crowdsec.c crowdsec_config.c crowdsec_util.c crowdsec_http.c \
+               crowdsec_lapi.c crowdsec_poller.c crowdsec_verdict.c crowdsec_appsec.c
 
 CROWDSEC_INC = -I@srcdir@ -I@srcdir@/vendor/yyjson
 

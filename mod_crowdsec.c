@@ -127,11 +127,10 @@ static apr_status_t cleanup_cache(void *data)
 
 int crowdsec_blocked_code(crowdsec_config_rec *conf)
 {
-    /* CrowdsecBlockedHTTPCode gets no default in create_crowdsec_dir_config,
-     * and Apache spells success as OK == 0 - so an unset directive used to
-     * return 0, which check_access reads as DECLINED, and the banned request
-     * went through. Resolved here rather than in the config creator so that
-     * an unset parent scope is not mistaken for one that set it explicitly.
+    /* Resolved here rather than seeded in the config creator, so that an unset
+     * parent scope is not mistaken for one that chose a value explicitly. The
+     * default cannot be left as the struct's zero: OK == 0 in Apache, which
+     * check_access reads as DECLINED and lets a banned request through.
      */
     return conf->blockedhttpcode_set ? conf->blockedhttpcode
         : HTTP_TOO_MANY_REQUESTS;
@@ -200,7 +199,6 @@ static int crowdsec_apply(request_rec *r, crowdsec_config_rec *conf,
     return code;
 }
 
-/* What to do when we could not get an answer at all. */
 static int crowdsec_fallback(request_rec *r, crowdsec_config_rec *conf,
                              const char *why)
 {
@@ -436,7 +434,6 @@ static int crowdsec_check_access(request_rec *r)
         }
     }
 
-    /* 3. Apply. */
     if (rem == CROWDSEC_REM_UNKNOWN || rem == CROWDSEC_REM_CAPTCHA) {
         if (rem == CROWDSEC_REM_CAPTCHA) {
             ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,

@@ -1,8 +1,7 @@
 /* The shared control region, and the lock that guards every touch of it.
  *
- * Internal to the store and the poller: crowdsec_lapi.c owns this memory and
- * crowdsec_poller.c reads and refreshes the lease in it. Nothing else includes
- * this header - the region is not part of the module's interface.
+ * Internal to crowdsec_lapi.c, which owns the memory, and crowdsec_poller.c,
+ * which refreshes the lease in it. Not part of the module's interface.
  */
 #ifndef CROWDSEC_STORE_H
 #define CROWDSEC_STORE_H
@@ -23,11 +22,11 @@ typedef struct
     apr_time_t last_run;
 } lease_t;
 
-/* The module's shared control state: about 90 bytes, fixed for the life of
- * the server. It used to live in the socache next to the decisions, which was
- * a category error - that is a cache, and force-expiring the oldest entry in
- * a subcache is normal operation for it, so this could be dropped at any
- * moment. Its own region cannot be evicted and needs no reserved keyspace.
+/* Shared control state, about 90 bytes and fixed for the life of the server.
+ * It gets its own region rather than a slot in the socache because losing any
+ * of it is unrecoverable - no prefix bitmap means range decisions stop
+ * matching, no primed flag means CrowdsecFallback decides every request - and
+ * force-expiring the oldest entry in a subcache is normal socache operation.
  * Every field is read and written under sconf->cache_mutex.
  */
 struct crowdsec_meta

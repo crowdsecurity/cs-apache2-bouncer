@@ -325,9 +325,9 @@ apr_size_t crowdsec_key_encode(const crowdsec_net_t *n, unsigned char *buf,
     for (i = 1; i < len; i++) {
         h = (h ^ buf[i]) * 16777619u;
     }
-    /* The whole byte range is available: mod_socache_shmcb picks a subcache
-     * with first_byte & (subcache_num - 1), so reserving a single value never
-     * isolated anything anyway, and the control state no longer lives here.
+    /* mod_socache_shmcb picks a subcache with first_byte & (subcache_num - 1),
+     * so a structured key beginning with a constant would collapse the whole
+     * cache into one subcache.
      */
     buf[0] = (unsigned char) (h & 0xffu);
 

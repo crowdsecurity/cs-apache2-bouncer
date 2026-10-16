@@ -1,8 +1,5 @@
 /* The stream poller: one thread per child, agreeing on a single puller through
- * a lease in the shared control region.
- *
- * Split out of crowdsec_lapi.c, which owns the store this writes into. The
- * lease lives in that region, so both files share crowdsec_store.h.
+ * a lease in the shared control region that crowdsec_lapi.c owns.
  */
 #include <string.h>
 #include <unistd.h>
@@ -28,11 +25,9 @@
 
 /* ------------------------------------------------------------- the poller */
 
-/* mod_watchdog's AP_WATCHDOG_SINGLETON was measured and rejected: it never
- * re-elects after the holding child dies, so an OOM-killed child would stop
- * polling permanently and silently. Instead every child runs a poller thread
- * and they agree on a leader through a lease in the shared cache. A dead
- * leader's lease goes stale and someone else claims it.
+/* Every child runs a poller thread and they agree on one leader through this
+ * lease, so that a child killed by the OOM killer or a crash cannot stop
+ * polling permanently: its lease goes stale and another child claims it.
  */
 
 static int lease_claim(crowdsec_server_rec *sconf, int *took_over)
@@ -344,7 +339,6 @@ static apr_status_t poller_cleanup(void *data)
     return APR_SUCCESS;
 }
 
-/* True when another server_rec in this child already polls the same cache. */
 static int poller_exists_for_cache(server_rec *base,
                                    const crowdsec_server_rec *want)
 {

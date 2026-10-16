@@ -1,8 +1,5 @@
-/* Configuration: the per-directory and per-server structures, their merges,
- * and every directive this module accepts.
- *
- * Split out of mod_crowdsec.c, where it was 43% of the file and had nothing to
- * do with handling a request. Nothing here runs on the request path.
+/* Every directive this module accepts, and the per-directory and per-server
+ * structures they fill in. Nothing here runs on the request path.
  */
 /*
  * MIT License
@@ -26,55 +23,6 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- */
-
-
-/*
- * The Apache mod_crowdsec module checks each request against the decisions
- * published by CrowdSec at https://www.crowdsec.net.
- *
- * When blocked, this module returns 429 Too Many Requests, as described in
- * https://datatracker.ietf.org/doc/html/rfc6585#section-4, or redirects to
- * the URL given by CrowdsecLocation.
- *
- *  Author: Graham Leggett
- *
- * Decisions are obtained either per request (CrowdsecMode live) or from the
- * decision stream, polled in the background and held in a shared cache
- * (CrowdsecMode stream). Stream mode needs CrowdsecCache and keeps every
- * decision locally, so it costs no round trip on the request path.
- *
- * Basic configuration:
- *
- * <IfModule !crowdsec_module>
- *   LoadModule crowdsec_module modules/mod_crowdsec.so
- * </IfModule>
- * <IfModule !socache_shmcb_module>
- *   LoadModule socache_shmcb_module modules/mod_socache_shmcb.so
- * </IfModule>
- *
- * CrowdsecURL http://localhost:8080
- * CrowdsecAPIKey [...]
- *
- * # stream mode wants room for every decision; see the directive docs for
- * # how to size this
- * CrowdsecCache shmcb:crowdsec(16777216)
- * CrowdsecMode stream
- * CrowdsecUpdateFrequency 10s
- *
- * <Location />
- *   Crowdsec on
- * </Location>
- *
- * <Location /one/>
- *   Crowdsec on
- *   ErrorDocument 429 "IP Address Blocked"
- * </Location>
- *
- * <Location /four/>
- *   Crowdsec on
- *   CrowdsecLocation https://somewhere.example.com/blocked.html?ip=%{REMOTE_ADDR}
- * </Location>
  */
 
 #include "crowdsec_config.h"
@@ -257,8 +205,8 @@ static const char *set_crowdsec_blockedhttpcode(cmd_parms *cmd, void *dconf,
     crowdsec_config_rec *conf = dconf;
     apr_off_t code;
 
-    /* Not atoi: it cannot tell "0" from "banana", and silently reading a
-     * typo as zero here used to mean OK, which means "allow".
+    /* Not atoi: it cannot tell "0" from "banana", and zero is OK here, which
+     * Apache spells as "allow".
      */
     if (!crowdsec_parse_size(arg, &code)) {
         return apr_psprintf(cmd->pool, "CrowdsecBlockedHTTPCode '%s' is not a "

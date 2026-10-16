@@ -459,10 +459,9 @@ static void memo_put(crowdsec_server_rec *sconf, const char *ip,
     }
 }
 
-/* In live mode the shared cache holds the verdict for one address, the way it
- * did before this module had a stream mode: without it every child process
- * would query the API separately for the same client, so a server with 150
- * children would multiply the API traffic by 150.
+/* In live mode the shared cache holds the verdict for one address: without it
+ * every child process would query the API separately for the same client, so
+ * a server with 150 children would multiply the API traffic by 150.
  *
  * This reuses the decision key space, which is safe because live and stream
  * are mutually exclusive for a vhost. The difference is that live mode stores
@@ -648,7 +647,6 @@ crowdsec_lookup_t crowdsec_lapi_lookup(request_rec *r,
         return lr;
     }
 
-    /* Stream mode. */
     if (!sconf->cache_instance || !sconf->meta) {
         return CROWDSEC_LOOKUP_FAIL;
     }

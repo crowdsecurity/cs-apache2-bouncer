@@ -476,13 +476,12 @@ crowdsec_appsec_res_t crowdsec_appsec_check(request_rec *r,
                       "inspected", cap);
         apr_table_setn(r->subprocess_env, "CROWDSEC_APPSEC_STATUS",
                        "body-bypass");
-        /* An allow, not a failure. Reporting this as CROWDSEC_APPSEC_FAIL put
-         * it through appsec_failure(), so CrowdsecAppsecFailureAction deny
-         * blocked exactly the oversized request that
-         * CrowdsecAppsecBodyLimitAction bypass promises to let through
-         * uninspected - a deliberate policy choice treated as an engine
-         * outage. Merging an allow keeps any ban the local API already found,
-         * and the normal allow path replays the captured prefix.
+        /* An allow, not a failure: bypass is a deliberate policy choice, so
+         * routing it through appsec_failure() would let
+         * CrowdsecAppsecFailureAction deny block the very request
+         * CrowdsecAppsecBodyLimitAction bypass promises to let through.
+         * Merging an allow keeps any ban the local API already found, and the
+         * normal allow path replays the captured prefix.
          */
         st->verdict.action = "allow";
         st->verdict.http_status = HTTP_OK;

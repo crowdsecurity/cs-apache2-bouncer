@@ -14,8 +14,8 @@
  *   gets                              -> nothing; never appropriate
  *
  * atoi is in the list for a specific reason: it cannot distinguish "0" from
- * "banana", and a directive that silently read a typo as zero used to mean OK,
- * which Apache spells as "allow".
+ * "banana", and zero is OK in Apache, which it spells as "allow" - so a typo
+ * in a status-code directive would open the request up rather than fail.
  */
 #ifndef CROWDSEC_POISON_H
 #define CROWDSEC_POISON_H

@@ -295,6 +295,40 @@ void crowdsec_appsec_replay(request_rec *r, crowdsec_req_rec *st)
     st->filter_installed = 1;
 }
 
+crowdsec_req_rec *crowdsec_appsec_inherit_body(request_rec *r)
+{
+    request_rec *prev;
+
+    /* ap_internal_redirect resets input_filters to proto_input_filters, which
+     * drops our ftype-29 filter from the chain, and the original request
+     * already drained HTTP_IN when it captured the body. Without re-installing
+     * against the captured copy, the redirect target's handler reads nothing -
+     * a POST through any mod_rewrite rule silently loses its body.
+     */
+    for (prev = r->prev; prev; prev = prev->prev) {
+        crowdsec_req_rec *old = ap_get_module_config(prev->request_config,
+                                                     &crowdsec_module);
+
+        if (old && old->body && old->body_len) {
+            crowdsec_req_rec *st = apr_pcalloc(r->pool, sizeof(*st));
+
+            /* Same bytes, fresh offset: the original never reached a handler,
+             * so nothing was replayed from it.
+             */
+            st->r = r;
+            st->body = old->body;
+            st->body_len = old->body_len;
+            st->inspect_len = old->inspect_len;
+            st->truncated = old->truncated;
+            ap_set_module_config(r->request_config, &crowdsec_module, st);
+            crowdsec_appsec_replay(r, st);
+
+            return st;
+        }
+    }
+    return NULL;
+}
+
 void crowdsec_appsec_register(apr_pool_t *p)
 {
     replay_filter_handle =
@@ -442,7 +476,18 @@ crowdsec_appsec_res_t crowdsec_appsec_check(request_rec *r,
                       "inspected", cap);
         apr_table_setn(r->subprocess_env, "CROWDSEC_APPSEC_STATUS",
                        "body-bypass");
-        return CROWDSEC_APPSEC_FAIL;
+        /* An allow, not a failure. Reporting this as CROWDSEC_APPSEC_FAIL put
+         * it through appsec_failure(), so CrowdsecAppsecFailureAction deny
+         * blocked exactly the oversized request that
+         * CrowdsecAppsecBodyLimitAction bypass promises to let through
+         * uninspected - a deliberate policy choice treated as an engine
+         * outage. Merging an allow keeps any ban the local API already found,
+         * and the normal allow path replays the captured prefix.
+         */
+        st->verdict.action = "allow";
+        st->verdict.http_status = HTTP_OK;
+        st->verdict.rem = CROWDSEC_REM_ALLOW;
+        return CROWDSEC_APPSEC_OK;
     }
 
     /* The holder lives in the pool, not on the stack: this cleanup runs when

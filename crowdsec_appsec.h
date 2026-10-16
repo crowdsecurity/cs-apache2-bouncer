@@ -55,4 +55,10 @@ int crowdsec_appsec_serve(request_rec *r, const crowdsec_appsec_verdict_t *v);
 /* Puts the captured body back for the real handler. Only on the allow path. */
 void crowdsec_appsec_replay(request_rec *r, crowdsec_req_rec *st);
 
+/* For an internal redirect: re-installs the replay filter against a body an
+ * earlier request in the chain already captured. Returns the new per-request
+ * state, or NULL if no ancestor had a body. See the comment in the body.
+ */
+crowdsec_req_rec *crowdsec_appsec_inherit_body(request_rec *r);
+
 #endif /* CROWDSEC_APPSEC_H */

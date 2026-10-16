@@ -303,6 +303,18 @@ static void test_appsec_basic(apr_pool_t *p)
     CHECK(av(p, "{\"action\":\"ban\",\"http_status\":403}", &v, &err), "ban");
     CHECK(v.rem == CROWDSEC_REM_BAN && v.http_status == 403, "ban fields");
 
+    /* The range check has to happen at full width. yyjson_get_int is 32-bit,
+     * so 4294967496 (2^32 + 200) narrowed to 200 and passed as a valid status.
+     */
+    CHECK(!av(p, "{\"action\":\"ban\",\"http_status\":4294967496}", &v, &err),
+          "http_status above 32 bits is rejected, not truncated");
+    CHECK(!av(p, "{\"action\":\"ban\",\"http_status\":-4294967096}", &v, &err),
+          "large negative http_status is rejected");
+    CHECK(!av(p, "{\"action\":\"ban\",\"http_status\":99}", &v, &err),
+          "http_status below 100 is rejected");
+    CHECK(!av(p, "{\"action\":\"ban\",\"http_status\":600}", &v, &err),
+          "http_status above 599 is rejected");
+
     /* A 200 can still say captcha when default_pass_action is set, which is
      * why the body is parsed on 200 as well as 403.
      */

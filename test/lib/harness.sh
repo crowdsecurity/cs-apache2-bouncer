@@ -155,6 +155,10 @@ wait_primed() {
     return 1
 }
 
+# Set HARNESS_NO_LAPI=1 to omit CrowdsecURL, for the AppSec-only configuration.
+# Injecting it unconditionally hid a real bug: child_init created no curl
+# handles without it, so an AppSec-only install inspected nothing.
+
 # Directives that give us several child processes, spelled for whichever MPM
 # is active: prefork counts servers, event and worker count threads.
 mpm_many_children() {
@@ -191,6 +195,11 @@ except OSError:
 # directives it is actually about.
 apache_start() {
     local extra="$1"
+    local lapi_line="CrowdsecURL http://127.0.0.1:$LAPI_PORT"
+
+    if [ -n "${HARNESS_NO_LAPI:-}" ]; then
+        lapi_line="# CrowdsecURL omitted: HARNESS_NO_LAPI is set"
+    fi
     cat > "$HARNESS_DIR/httpd.conf" <<CONF
 ServerRoot "$HARNESS_DIR"
 # mod_cgid and the file-based mutexes put their sockets here; without it they
@@ -224,7 +233,7 @@ LoadModule crowdsec_module $MODULE
     Crowdsec off
 </Location>
 
-CrowdsecURL http://127.0.0.1:$LAPI_PORT
+$lapi_line
 CrowdsecAPIKey testkey
 $extra
 CONF

@@ -302,6 +302,11 @@ static int crowdsec_check_access(request_rec *r)
      * headers only - see the body handling in crowdsec_appsec_check.
      */
     if (r->prev && decided_earlier(r)) {
+        /* The verdict carries over, but the body does not: the redirect lost
+         * our input filter and HTTP_IN is already drained, so hand the
+         * captured copy to this request's handler.
+         */
+        crowdsec_appsec_inherit_body(r);
         return DECLINED;
     }
     if (!sconf) {
@@ -366,13 +371,25 @@ static int crowdsec_check_access(request_rec *r)
     /* 1. The local API's view, from the stream cache or a live query. */
     if (conf->enable && sconf->url) {
         lr = crowdsec_lapi_lookup(r, sconf, ip, &rem);
-        if (lr == CROWDSEC_LOOKUP_UNPRIMED) {
-            return crowdsec_fallback(r, conf,
-                                     "the decision stream has not been "
-                                     "loaded yet");
-        }
         if (lr != CROWDSEC_LOOKUP_OK) {
-            return crowdsec_fallback(r, conf, "could not query crowdsec");
+            int fb = crowdsec_fallback(r, conf,
+                                       lr == CROWDSEC_LOOKUP_UNPRIMED
+                                       ? "the decision stream has not been "
+                                         "loaded yet"
+                                       : "could not query crowdsec");
+
+            /* Only an allow fallback carries on. Returning here whenever the
+             * local API was unreachable would also switch off a perfectly
+             * healthy AppSec - and CROWDSEC_LOOKUP_UNPRIMED happens on every
+             * start in stream mode, so inspection would be off for the first
+             * seconds after each restart. It would also let the challenge
+             * endpoints fall through to the origin, which is the
+             * permanently-stuck case the carve-out exists to prevent.
+             */
+            if (fb != DECLINED) {
+                return fb;
+            }
+            /* rem stays ALLOW; whatever AppSec says below decides. */
         }
     }
 
@@ -397,6 +414,20 @@ static int crowdsec_check_access(request_rec *r)
             rem = crowdsec_rem_merge(rem, CROWDSEC_REM_BAN);
             break;
         case CROWDSEC_APPSEC_BADREQ:
+            /* A body read that failed already knows why: 413 for
+             * LimitRequestBody, 408 on a read timeout, 501 for an
+             * unimplemented transfer encoding. AP_FILTER_ERROR means a filter
+             * has already produced the response, so pass it straight through.
+             * Flattening all of these to 400 is what the comment on
+             * capture_body claimed was not happening.
+             */
+            if (st->read_rv != APR_SUCCESS) {
+                if (st->read_rv == AP_FILTER_ERROR) {
+                    return AP_FILTER_ERROR;
+                }
+                return ap_map_http_request_error(st->read_rv,
+                                                 HTTP_BAD_REQUEST);
+            }
             return HTTP_BAD_REQUEST;
         case CROWDSEC_APPSEC_FAIL:
         default:
@@ -690,7 +721,13 @@ static void crowdsec_child_init(apr_pool_t *pchild, server_rec *s)
         crowdsec_server_rec *sconf =
             ap_get_module_config(s_vhost->module_config, &crowdsec_module);
 
-        if (!sconf->url || sconf->curl_handles) {
+        /* Either endpoint needs handles. Guarding on url alone left an
+         * AppSec-only configuration (CrowdsecAppsecURL without CrowdsecURL,
+         * which post_config accepts) with no handles at all, so every
+         * inspection failed instantly and the default passthrough let
+         * everything by uninspected - silently.
+         */
+        if ((!sconf->url && !sconf->appsec_url) || sconf->curl_handles) {
             continue;           /* vhosts sharing a config share its handles */
         }
         sconf->curl_handles = handles;
@@ -1223,6 +1260,10 @@ static const char *set_crowdsec_appsec_url(cmd_parms *cmd, void *dconf,
             len--;
         }
         sconf->appsec_url = apr_pstrmemdup(cmd->pool, arg, len);
+        /* Drop any socket a previous unix: form in this scope derived, or
+         * libcurl keeps connecting to it and ignores this URL entirely.
+         */
+        sconf->appsec_socket = NULL;
     }
     sconf->appsec_url_set = 1;
 

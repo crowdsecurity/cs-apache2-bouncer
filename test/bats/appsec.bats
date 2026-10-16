@@ -24,6 +24,53 @@ $1
 CONF
 }
 
+@test "a local API outage does not switch off a healthy WAF" {
+    # CrowdsecFallback allow used to return straight out of the hook, so any
+    # failed lookup skipped inspection entirely. CROWDSEC_LOOKUP_UNPRIMED hits
+    # that path on every start in stream mode, which meant the WAF was off for
+    # the first seconds after each restart.
+    appsec_set '{"action":"ban","http_status":403,"status":403}'
+    dead="$(harness_free_port)"
+    apache_start "$(appsec_conf "
+Crowdsec On
+CrowdsecURL http://127.0.0.1:$dead
+CrowdsecAPIKey testkey
+CrowdsecFallback allow
+CrowdsecBlockedHTTPCode 403")"
+    # The local API is unreachable, the fallback allows - and AppSec still bans.
+    [ "$(http_status)" = 403 ]
+    [ "$(appsec_calls)" -ge 1 ]
+}
+
+@test "a local API outage with fallback block still blocks" {
+    # The other direction: a blocking fallback must not be overridden by a
+    # permissive AppSec verdict.
+    appsec_set '{"action":"allow","http_status":200}'
+    dead="$(harness_free_port)"
+    apache_start "$(appsec_conf "
+Crowdsec On
+CrowdsecURL http://127.0.0.1:$dead
+CrowdsecAPIKey testkey
+CrowdsecFallback block
+CrowdsecBlockedHTTPCode 403")"
+    [ "$(http_status)" = 403 ]
+}
+
+@test "an AppSec-only configuration actually inspects" {
+    # No CrowdsecURL at all. post_config accepts this, but child_init used to
+    # create curl handles only when CrowdsecURL was set, so every inspection
+    # failed instantly and the default passthrough let everything by. The rest
+    # of this file always sets CrowdsecURL, which is what hid it.
+    appsec_set '{"action":"ban","http_status":403,"status":403}'
+    HARNESS_NO_LAPI=1 apache_start "CrowdsecAppsecURL http://127.0.0.1:$APPSEC_PORT
+CrowdsecCacheTimeout 1s
+Crowdsec Off
+CrowdsecAppsec On
+CrowdsecBlockedHTTPCode 403"
+    [ "$(http_status)" = 403 ]
+    [ "$(appsec_calls)" -ge 1 ]
+}
+
 @test "allow lets the request reach the origin" {
     appsec_set '{"action":"allow","http_status":200}'
     apache_start "$(appsec_conf)"

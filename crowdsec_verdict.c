@@ -490,10 +490,26 @@ int crowdsec_appsec_parse(const char *buf, apr_size_t len, apr_pool_t *p,
         *err = "no http_status";
         goto done;
     }
-    out->http_status = yyjson_get_int(v);
-    if (out->http_status < 100 || out->http_status > 599) {
-        *err = "http_status out of range";
-        goto done;
+    /* Check at full width, then narrow. yyjson_get_int is 32-bit, so a
+     * status of 4294967496 would truncate to 200 and pass as valid.
+     */
+    if (yyjson_is_uint(v)) {
+        uint64_t u = yyjson_get_uint(v);
+
+        if (u < 100 || u > 599) {
+            *err = "http_status out of range";
+            goto done;
+        }
+        out->http_status = (int) u;
+    }
+    else {
+        int64_t i = yyjson_get_sint(v);
+
+        if (i < 100 || i > 599) {
+            *err = "http_status out of range";
+            goto done;
+        }
+        out->http_status = (int) i;
     }
 
     v = yyjson_obj_get(root, "user_body_content");

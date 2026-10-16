@@ -51,6 +51,29 @@ post_echo() {
         "http://127.0.0.1:$APACHE_PORT/echo"
 }
 
+@test "a POST through an internal redirect still reaches the handler" {
+    # Found on a real PHP app, not here: a per-directory RewriteRule reaches its
+    # target through ap_internal_redirect, which resets input_filters to
+    # proto_input_filters and so drops our replay filter - while HTTP_IN was
+    # already drained to inspect the body. The handler then read nothing and
+    # every POST through any rewrite silently lost its body.
+    appsec_set '{"action":"allow","http_status":200}'
+    # Per-directory context on purpose: a server-context rule with [PT] rewrites
+    # in place on the same request_rec and never sets r->prev, so it cannot
+    # reproduce this. Only the per-directory form calls ap_internal_redirect.
+    apache_start "$(body_conf "
+<Directory \"$HARNESS_DIR/htdocs\">
+    RewriteEngine On
+    RewriteRule ^jump\$ /echo
+</Directory>")"
+    head -c 4096 /dev/urandom > "$HARNESS_DIR/payload"
+    want="$(md5sum < "$HARNESS_DIR/payload" | cut -d' ' -f1)"
+    run curl -s --max-time 15 -X POST --data-binary "@$HARNESS_DIR/payload" \
+        "http://127.0.0.1:$APACHE_PORT/jump"
+    [[ "$output" == *"len=4096"* ]]
+    [[ "$output" == *"md5=$want"* ]]
+}
+
 @test "a small body is inspected and still reaches the handler intact" {
     # This is the one that breaks PHP if it is wrong: we consume the body to
     # inspect it, so it has to be put back.
@@ -168,6 +191,47 @@ CrowdsecAppsecBodyLimitAction bypass')"
         --data-binary "@$HARNESS_DIR/payload" \
         "http://127.0.0.1:$APACHE_PORT/echo"
     [ "$output" = 413 ]
+}
+
+@test "bypass is a policy choice, not a failure, even with deny" {
+    # The two directives contradicted each other: an oversized body with
+    # BodyLimitAction bypass was reported as an engine failure, so
+    # AppsecFailureAction deny blocked exactly what bypass promises to allow
+    # through uninspected.
+    appsec_set '{"action":"allow","http_status":200}'
+    apache_start "$(body_conf '
+CrowdsecAppsecBodyLimit 1k
+CrowdsecAppsecBodyLimitAction bypass
+CrowdsecAppsecFailureAction deny
+CrowdsecBlockedHTTPCode 403')"
+    head -c 4096 /dev/urandom > "$HARNESS_DIR/payload"
+    want="$(md5sum < "$HARNESS_DIR/payload" | cut -d' ' -f1)"
+    run post_echo "$HARNESS_DIR/payload"
+    # Allowed, and the handler still receives every byte.
+    [[ "$output" == *"len=4096"* ]]
+    [[ "$output" == *"md5=$want"* ]]
+}
+
+@test "a stalled body read reports its own status, not a flat 400" {
+    # read_rv was saved and only ever logged, so every read failure collapsed
+    # to 400 - including a timeout, which has its own status. Verified: 400
+    # before the fix, 408 after.
+    appsec_set '{"action":"allow","http_status":200}'
+    apache_start "$(body_conf 'Timeout 2')"
+    run python3 -c "
+import socket
+s=socket.create_connection(('127.0.0.1',$APACHE_PORT),10); s.settimeout(20)
+s.sendall(b'POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n')
+buf=b''
+try:
+    while b'\r\n\r\n' not in buf:
+        d=s.recv(4096)
+        if not d: break
+        buf+=d
+except Exception: pass
+print(buf.split(b'\r\n')[0].decode('latin1') if buf else 'NO RESPONSE')
+"
+    [[ "$output" == *"408"* ]]
 }
 
 @test "a gzipped body is inflated for the handler" {

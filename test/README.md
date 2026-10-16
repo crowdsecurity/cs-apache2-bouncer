@@ -39,10 +39,10 @@ gcc -Wall -Wextra -Werror -g -fsanitize=address,undefined \
 ```
 
 `test/unit/mod_scan_conformance.c` is a test-only Apache module. The header
-sanitisers are reimplemented as byte tables because Apache's `ap_scan_*` live in
+sanitisers are reimplemented locally because Apache's `ap_scan_*` live in
 the httpd binary rather than a shared library, so they cannot be linked from a
-standalone test. This module runs inside the server and asserts the tables agree
-with the real functions for every byte; `test/bats/scan-conformance.bats` drives
+standalone test. This module runs inside the server and asserts the
+reimplementations agree with the real functions for every byte; `test/bats/scan-conformance.bats` drives
 it. Build it with:
 
 ```

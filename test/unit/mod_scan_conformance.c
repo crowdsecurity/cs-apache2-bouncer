@@ -1,4 +1,4 @@
-/* Test-only module: asserts crowdsec_util's byte tables agree with Apache's
+/* Test-only module: asserts crowdsec_util's sanitisers agree with Apache's
  * own ap_scan_* for every single-byte input plus a multi-byte corpus.
  *
  * ap_scan_* live in the httpd binary rather than a shared library, so this

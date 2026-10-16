@@ -154,6 +154,17 @@ static void test_body_take(void)
     CHECK(crowdsec_body_take(APR_INT64_C(0x7ffffffffffffff0), 100,
                              APR_INT64_C(0x7ffffffffffffff8), &take)
           && take == 8, "no overflow near max");
+    /* A chunk above the signed maximum must still be clamped to the cap: cast
+     * to apr_off_t it reads negative, so a signed compare hands back the lot.
+     */
+    if (sizeof(apr_size_t) >= 8) {
+        CHECK(crowdsec_body_take(0, (apr_size_t) APR_UINT64_C(0xfffffffffffffff0),
+                                 1000, &take) && take == 1000,
+              "chunk above the signed maximum is capped");
+        CHECK(crowdsec_body_take(0, (apr_size_t) APR_UINT64_C(0x8000000000000000),
+                                 1000, &take) && take == 1000,
+              "chunk at the signed boundary is capped");
+    }
 }
 
 static void test_cidr(void)

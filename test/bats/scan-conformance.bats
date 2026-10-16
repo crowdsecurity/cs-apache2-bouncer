@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
-# The header sanitisers are reimplemented as byte tables because Apache's
-# ap_scan_* are not linkable from a standalone test. This proves the tables
+# The header sanitisers are reimplemented locally because Apache's
+# ap_scan_* are not linkable from a standalone test. This proves they
 # agree with the real thing, so "parity with Apache's parser" is a measured
 # claim rather than an intention.
 
@@ -15,7 +15,7 @@ teardown() {
     harness_cleanup
 }
 
-@test "sanitiser tables match Apache's ap_scan_* for every byte" {
+@test "sanitisers match Apache's ap_scan_* for every byte" {
     [ -f "$CONF_MOD" ] || skip "conformance module not built"
     lapi_start "null"
     apache_start "LoadModule scan_conformance_module $CONF_MOD"

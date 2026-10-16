@@ -17,9 +17,9 @@
 
 /*
  * Apache's scanners live in libhttpd, which a standalone test binary cannot
- * link, so they are reproduced here as tables. tests/t_util.c asserts byte-for
- * -byte agreement with the real ap_scan_* for all 256 single-byte inputs, so
- * these stay honest rather than merely looking right.
+ * link, so they are reproduced here. test/unit/mod_scan_conformance.c asserts
+ * byte-for-byte agreement with the real ap_scan_* for all 256 single-byte
+ * inputs, so these stay honest rather than merely looking right.
  */
 
 /* RFC7230 3.2.6 tchar. */
@@ -41,37 +41,20 @@ static const unsigned char tbl_token[256] = {
     ['y'] = 1, ['z'] = 1
 };
 
-static int tbl_ready;
-static unsigned char tbl_field[256];   /* VCHAR + obs-text + HT + SP */
-static unsigned char tbl_vchar[256];   /* VCHAR + obs-text          */
-
-static void tbl_init(void)
+/* Unlike tchar, these two are contiguous ranges, so they are predicates rather
+ * than tables. A table would have to be built at runtime, and publishing it
+ * from one thread without a barrier is a data race: another thread can see the
+ * ready flag before the bytes, read an all-zero table, and reject a valid
+ * header.
+ */
+static int is_vchar_obstext(unsigned char c)
 {
-    int c;
-
-    for (c = 0x21; c <= 0x7e; c++) {    /* VCHAR */
-        tbl_field[c] = 1;
-        tbl_vchar[c] = 1;
-    }
-    for (c = 0x80; c <= 0xff; c++) {    /* obs-text */
-        tbl_field[c] = 1;
-        tbl_vchar[c] = 1;
-    }
-    tbl_field['\t'] = 1;
-    tbl_field[' '] = 1;
-
-    tbl_ready = 1;
+    return (c >= 0x21 && c <= 0x7e) || c >= 0x80;
 }
 
-/* Racing here is harmless: every writer computes the same bytes, and the
- * values only ever go 0 -> 1. Avoids needing a mutex or a child_init hook for
- * something this small.
- */
-static void tbl_need(void)
+static int is_field_content(unsigned char c)
 {
-    if (!tbl_ready) {
-        tbl_init();
-    }
+    return is_vchar_obstext(c) || c == '\t' || c == ' ';
 }
 
 static int scan_all(const char *s, const unsigned char *tbl)
@@ -90,6 +73,22 @@ static int scan_all(const char *s, const unsigned char *tbl)
     return 1;
 }
 
+static int scan_all_pred(const char *s, int (*ok)(unsigned char))
+{
+    const unsigned char *p = (const unsigned char *) s;
+
+    if (!s) {
+        return 0;
+    }
+    while (*p) {
+        if (!ok(*p)) {
+            return 0;
+        }
+        p++;
+    }
+    return 1;
+}
+
 int crowdsec_hdr_name_ok(const char *s)
 {
     return scan_all(s, tbl_token);
@@ -97,14 +96,12 @@ int crowdsec_hdr_name_ok(const char *s)
 
 int crowdsec_hdr_value_ok(const char *s)
 {
-    tbl_need();
-    return scan_all(s, tbl_field);
+    return scan_all_pred(s, is_field_content);
 }
 
 int crowdsec_target_ok(const char *s)
 {
-    tbl_need();
-    return scan_all(s, tbl_vchar);
+    return scan_all_pred(s, is_vchar_obstext);
 }
 
 const char *crowdsec_http_version_hdr(int proto_num)
@@ -193,9 +190,14 @@ int crowdsec_body_take(apr_off_t used, apr_size_t chunk, apr_off_t cap,
     if (used < 0 || cap < 0 || used >= cap) {
         return 0;
     }
-    /* Never used + chunk: that is the overflow. */
+    /* Never used + chunk: that is the overflow. The comparison is unsigned
+     * because chunk is, and a value above the signed maximum would cast to a
+     * negative apr_off_t, compare below room, and hand back the whole chunk -
+     * defeating the cap this function exists to enforce.
+     */
     room = cap - used;
-    *take = ((apr_off_t) chunk > room) ? (apr_size_t) room : chunk;
+    *take = ((apr_uint64_t) chunk > (apr_uint64_t) room)
+        ? (apr_size_t) room : chunk;
 
     return *take > 0;
 }

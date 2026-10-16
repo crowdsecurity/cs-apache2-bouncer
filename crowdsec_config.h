@@ -10,6 +10,7 @@
 #include "http_config.h"
 #include "ap_expr.h"
 #include "ap_socache.h"
+#include "apr_shm.h"
 #include "util_mutex.h"
 
 #include "apr_hash.h"
@@ -83,10 +84,24 @@ typedef struct
     apr_interval_time_t timeout;
     apr_interval_time_t cache_timeout;
 
-    /* shared decision cache */
+    /* shared decision cache. cache_owned marks the one server_rec whose own
+     * CrowdsecCache created the instance; vhosts that merely inherit it share
+     * the same instance pointer and must not initialise or destroy it again.
+     */
     apr_global_mutex_t *cache_mutex;
     const ap_socache_provider_t *cache_provider;
     ap_socache_instance_t *cache_instance;
+    unsigned int cache_owned:1;
+
+    /* Lease, primed flag, statistics and prefix bitmaps. Fixed-size control
+     * state, so it lives in its own shared region rather than in the socache:
+     * that is a cache, free to evict anything, and losing the prefix bitmaps
+     * stops range decisions matching while losing the primed flag hands every
+     * request to CrowdsecFallback. Guarded by cache_mutex. Layout is private
+     * to crowdsec_lapi.c.
+     */
+    apr_shm_t *meta_shm;
+    struct crowdsec_meta *meta;
 
     /* --- per-child runtime, set in child_init, never merged --- */
     apr_reslist_t *curl_handles;

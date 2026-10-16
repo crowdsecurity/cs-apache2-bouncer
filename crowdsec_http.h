@@ -54,6 +54,12 @@ typedef struct
     apr_off_t ceiling;
     int ssl_verify;
     const char *ca_file;        /* or NULL for the system store */
+    /* Called periodically while the transfer runs. Returning non-zero aborts
+     * it. Lets a long pull prove the puller is still alive without waiting
+     * for the transfer to finish. NULL to disable.
+     */
+    int (*progress)(void *data);
+    void *progress_data;
 } crowdsec_http_req_t;
 
 /* Once per child, before any other call here. Returns APR_SUCCESS or logs

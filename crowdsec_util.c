@@ -350,10 +350,11 @@ apr_size_t crowdsec_key_encode(const crowdsec_net_t *n, unsigned char *buf,
     for (i = 1; i < len; i++) {
         h = (h ^ buf[i]) * 16777619u;
     }
-    /* 0 is reserved for metadata keys, which must not share a subcache with
-     * decisions that could evict them.
+    /* The whole byte range is available: mod_socache_shmcb picks a subcache
+     * with first_byte & (subcache_num - 1), so reserving a single value never
+     * isolated anything anyway, and the control state no longer lives here.
      */
-    buf[0] = (unsigned char) (h % 255u) + 1u;
+    buf[0] = (unsigned char) (h & 0xffu);
 
     return len;
 }

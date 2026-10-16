@@ -112,6 +112,33 @@ CONF
     [ "$(http_status)" = 200 ]
 }
 
+@test "a failed pull forces a full resync, so its batch is not lost" {
+    # The engine advances its own stream cursor once it has finished writing a
+    # response, so a batch we fail to read is never resent to an incremental
+    # pull. Unless a failure forces startup=true, everything in that batch is
+    # missed for good - here, the ban that arrives during the outage.
+    lapi_set '{"decisions":[],"sticky":true}'
+    apache_start "$(stream_conf)"
+    wait_primed
+
+    # Break the API and let at least one pull fail.
+    lapi_set '{"status":500}'
+    sleep 3
+
+    # Heal, publishing a ban. lapi_set replaces the whole state, so the stub's
+    # counters restart from zero here: any startup=true pull counted from now
+    # on can only be the resync the failure forced.
+    lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip)],\"sticky\":true}"
+
+    for _ in $(seq 60); do
+        [ "$(lapi_get startup_seen)" != "" ] \
+            && [ "$(lapi_get startup_seen)" -ge 1 ] && break
+        sleep 0.2
+    done
+    [ "$(lapi_get startup_seen)" -ge 1 ]
+    [ "$(http_status)" = 429 ]
+}
+
 @test "the first pull asks for the full set" {
     lapi_set "{\"decisions\":[],\"sticky\":true}"
     apache_start "$(stream_conf)"

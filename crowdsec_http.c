@@ -244,12 +244,35 @@ const char *crowdsec_http_err_str(crowdsec_http_err_t e)
     }
 }
 
+/* curl calls this every few hundred milliseconds during a transfer. The
+ * caller's hook returns non-zero to abort, which curl reports as an error.
+ */
+static int xferinfo(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+                    curl_off_t ultotal, curl_off_t ulnow)
+{
+    const crowdsec_http_req_t *req = clientp;
+
+    (void) dltotal;
+    (void) dlnow;
+    (void) ultotal;
+    (void) ulnow;
+
+    return req->progress ? req->progress(req->progress_data) : 0;
+}
+
 static long ms_of(apr_interval_time_t t)
 {
+    long ms;
+
     if (t <= 0) {
         return 0;               /* curl reads 0 as "no limit" */
     }
-    return (long) apr_time_as_msec(t);
+    /* Round a positive budget up to 1ms rather than down to 0, which curl
+     * would read as "no limit" and turn a tight timeout into none at all.
+     */
+    ms = (long) apr_time_as_msec(t);
+
+    return ms > 0 ? ms : 1;
 }
 
 static void apply_hardening(CURL *h)
@@ -330,6 +353,14 @@ crowdsec_http_err_t crowdsec_http_exchange(apr_reslist_t *handles,
      * entire budget without ever timing out. The window is the caller's
      * choice: see low_speed_time.
      */
+    if (req->progress) {
+        curl_easy_setopt(h, CURLOPT_XFERINFOFUNCTION, xferinfo);
+        curl_easy_setopt(h, CURLOPT_XFERINFODATA, (void *) req);
+        curl_easy_setopt(h, CURLOPT_NOPROGRESS, 0L);
+    }
+    else {
+        curl_easy_setopt(h, CURLOPT_NOPROGRESS, 1L);
+    }
     if (req->low_speed_time > 0) {
         curl_easy_setopt(h, CURLOPT_LOW_SPEED_LIMIT, 1L);
         curl_easy_setopt(h, CURLOPT_LOW_SPEED_TIME,

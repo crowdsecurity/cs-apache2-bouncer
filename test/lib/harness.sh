@@ -11,6 +11,12 @@ harness_init() {
     [ -f "$MODULE" ] || { echo "module not built: $MODULE (run: apxs -c mod_crowdsec.c)" >&2; return 1; }
     mkdir -p "$HARNESS_DIR"/{logs,htdocs,run}
     echo origin-ok > "$HARNESS_DIR/htdocs/index.html"
+    # Targets for the internal-redirect tests: mod_rewrite without [R] and
+    # ErrorDocument both reach their target through an internal redirect.
+    mkdir -p "$HARNESS_DIR/htdocs/guarded" "$HARNESS_DIR/htdocs/open"
+    echo guarded-ok > "$HARNESS_DIR/htdocs/guarded/index.html"
+    echo open-ok > "$HARNESS_DIR/htdocs/open/index.html"
+    echo denied-doc > "$HARNESS_DIR/htdocs/denied.html"
 }
 
 harness_cleanup() {
@@ -66,7 +72,19 @@ lapi_api_start() {
 }
 
 # lapi_set <json>   replace the whole state
-lapi_set() { echo "$1" > "$LAPI_STATE"; }
+#
+# Publishes by rename, so the stub can never read a half-written file, and
+# takes the stub's lock so the write cannot land inside a pull's
+# load/modify/save and be overwritten by the state it had already read.
+lapi_set() {
+    local tmp="$LAPI_STATE.new.$$"
+
+    printf '%s' "$1" > "$tmp"
+    (
+        flock 9
+        mv -f "$tmp" "$LAPI_STATE"
+    ) 9>"$LAPI_STATE.lock"
+}
 
 # lapi_get <key>    read one key back (counters the stub maintains)
 lapi_get() {
@@ -151,6 +169,7 @@ LoadModule dir_module /usr/lib/apache2/modules/mod_dir.so
 LoadModule proxy_module /usr/lib/apache2/modules/mod_proxy.so
 LoadModule proxy_http_module /usr/lib/apache2/modules/mod_proxy_http.so
 LoadModule socache_shmcb_module /usr/lib/apache2/modules/mod_socache_shmcb.so
+LoadModule rewrite_module /usr/lib/apache2/modules/mod_rewrite.so
 LoadModule crowdsec_module $MODULE
 
 <Directory "$HARNESS_DIR/htdocs">

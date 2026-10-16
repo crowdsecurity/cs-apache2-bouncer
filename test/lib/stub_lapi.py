@@ -17,15 +17,37 @@ Decisions handed out as "new" are cleared after a pull unless "sticky" is set,
 which mirrors the real API: a startup pull repeats everything, an incremental
 one only reports changes.
 """
+import fcntl
 import json
 import os
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 port = int(sys.argv[1])
 state_path = sys.argv[2]
+lock_path = state_path + ".lock"
+
+# A pull is a read-modify-write: it reports the pending decisions and then
+# clears them. Without holding a lock across the whole thing, a test writing
+# the next fixture in between has its write overwritten by the state we had
+# already read. The threading lock covers our own ThreadingHTTPServer workers,
+# the flock covers the test harness writing from another process.
+_threads = threading.Lock()
+
+
+@contextmanager
+def state_locked():
+    with _threads:
+        with open(lock_path, "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lk, fcntl.LOCK_UN)
 
 
 def load():
@@ -72,20 +94,26 @@ class Handler(BaseHTTPRequestHandler):
 
         if url.path == "/v1/decisions/stream":
             startup = query.get("startup", ["false"])[0] == "true"
-            state["pulls"] = int(state.get("pulls", 0)) + 1
-            if startup:
-                state["startup_seen"] = int(state.get("startup_seen", 0)) + 1
 
-            new = state.get("decisions", [])
-            deleted = state.get("deleted", [])
-            payload = {"new": new, "deleted": deleted}
+            # Re-read inside the lock: the copy above was taken without it and
+            # may already be stale.
+            with state_locked():
+                state = load()
+                state["pulls"] = int(state.get("pulls", 0)) + 1
+                if startup:
+                    state["startup_seen"] = \
+                        int(state.get("startup_seen", 0)) + 1
 
-            # An incremental pull reports changes once; a startup pull repeats
-            # the full set, which is what makes leader takeover safe.
-            if not startup and not state.get("sticky"):
-                state["decisions"] = []
-                state["deleted"] = []
-            save(state)
+                new = state.get("decisions", [])
+                deleted = state.get("deleted", [])
+                payload = {"new": new, "deleted": deleted}
+
+                # An incremental pull reports changes once; a startup pull
+                # repeats the full set, which is what makes takeover safe.
+                if not startup and not state.get("sticky"):
+                    state["decisions"] = []
+                    state["deleted"] = []
+                save(state)
             self.reply(200, payload)
             return
 

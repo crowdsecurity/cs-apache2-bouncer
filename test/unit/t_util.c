@@ -335,14 +335,16 @@ static void test_key_encode(void)
                          (j >> 16) & 255, (j >> 8) & 255, j & 255);
             CHECK(crowdsec_cidr_parse(ip, &m), "gen %s", ip);
             crowdsec_key_encode(&m, k, sizeof(k));
-            CHECK(k[0] != 0, "spread byte never 0");
             if (!seen[k[0]]) {
                 seen[k[0]] = 1;
                 distinct++;
             }
         }
-        /* 512 sequential addresses should touch most of the 255 buckets */
-        CHECK(distinct > 180, "leading byte spreads: %d distinct of 255",
+        /* 512 sequential addresses should touch most of the 256 buckets. The
+         * whole range is in play: no value is reserved, because the control
+         * state lives in its own shared region rather than in this cache.
+         */
+        CHECK(distinct > 180, "leading byte spreads: %d distinct of 256",
               distinct);
     }
 

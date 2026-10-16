@@ -19,16 +19,6 @@
 /* must be last: see the file for why */
 #include "crowdsec_poison.h"
 
-/* Meta keys share the socache with decision keys. Decision keys always start
- * with the address family (4 or 6), so a leading zero cannot collide with
- * one, and four bytes clears shmcb's minimum key length.
- */
-static const unsigned char key_primed[4] = { 0, 'C', 'S', 'P' };
-static const unsigned char key_plen4[4] = { 0, 'C', 'S', '4' };
-static const unsigned char key_plen6[4] = { 0, 'C', 'S', '6' };
-static const unsigned char key_lease[4] = { 0, 'C', 'S', 'L' };
-static const unsigned char key_stats[4] = { 0, 'C', 'S', 'T' };
-
 /* Which prefix lengths currently exist in the store, so a lookup probes two
  * or three candidates instead of all 33 or 129.
  */
@@ -42,6 +32,48 @@ typedef struct
     apr_int64_t holder;         /* pid of the child doing the polling */
     apr_time_t last_run;
 } lease_t;
+
+/* The module's shared control state: about 90 bytes, fixed for the life of
+ * the server. It used to live in the socache next to the decisions, which was
+ * a category error - that is a cache, and force-expiring the oldest entry in
+ * a subcache is normal operation for it, so this could be dropped at any
+ * moment. Its own region cannot be evicted and needs no reserved keyspace.
+ * Every field is read and written under sconf->cache_mutex.
+ */
+struct crowdsec_meta
+{
+    lease_t lease;
+    apr_time_t primed_at;
+    crowdsec_store_stats_t stats;
+    plen_set_t plens4;
+    plen_set_t plens6;
+};
+
+apr_status_t crowdsec_meta_create(apr_pool_t *pconf,
+                                  crowdsec_server_rec *sconf)
+{
+    apr_status_t rv;
+
+    rv = apr_shm_create(&sconf->meta_shm, sizeof(struct crowdsec_meta), NULL,
+                        pconf);
+    if (rv != APR_SUCCESS) {
+        /* Anonymous shared memory is unavailable on some platforms, so fall
+         * back to a named segment in the runtime directory.
+         */
+        const char *path = ap_runtime_dir_relative(pconf, "crowdsec_meta.shm");
+
+        apr_file_remove(path, pconf);
+        rv = apr_shm_create(&sconf->meta_shm,
+                            sizeof(struct crowdsec_meta), path, pconf);
+    }
+    if (rv != APR_SUCCESS) {
+        return rv;
+    }
+    sconf->meta = apr_shm_baseaddr_get(sconf->meta_shm);
+    memset(sconf->meta, 0, sizeof(*sconf->meta));
+
+    return APR_SUCCESS;
+}
 
 #define DECISION_VALUE_VERSION 1
 
@@ -82,53 +114,19 @@ static void store_unlock(crowdsec_server_rec *sconf)
     }
 }
 
-/* Caller holds the lock. */
-static int meta_get(server_rec *s, crowdsec_server_rec *sconf,
-                    const unsigned char *key, void *out, apr_size_t outlen)
-{
-    unsigned int len = (unsigned int) outlen;
-
-    if (!sconf->cache_instance) {
-        return 0;
-    }
-    if (sconf->cache_provider->retrieve(sconf->cache_instance, s, key, 4,
-                                        out, &len, NULL) != APR_SUCCESS) {
-        return 0;
-    }
-    return len == outlen;
-}
-
-static void meta_put(server_rec *s, crowdsec_server_rec *sconf,
-                     const unsigned char *key, const void *val,
-                     apr_size_t vallen, apr_pool_t *p)
-{
-    if (!sconf->cache_instance) {
-        return;
-    }
-    /* Metadata must outlive any decision, so give it a far expiry rather than
-     * a duration; losing it would silently un-prime the store.
-     */
-    sconf->cache_provider->store(sconf->cache_instance, s, key, 4,
-                                 apr_time_now() + CROWDSEC_DURATION_MAX,
-                                 (unsigned char *) val,
-                                 (unsigned int) vallen, p);
-}
-
 int crowdsec_store_stats(server_rec *s, crowdsec_server_rec *sconf,
                          crowdsec_store_stats_t *out)
 {
-    int ok;
-
-    if (!sconf->cache_instance || !out) {
+    if (!sconf->meta || !out) {
         return 0;
     }
     if (store_lock(sconf) != APR_SUCCESS) {
         return 0;
     }
-    ok = meta_get(s, sconf, key_stats, out, sizeof(*out));
+    *out = sconf->meta->stats;
     store_unlock(sconf);
 
-    return ok;
+    return 1;
 }
 
 /* ------------------------------------------------------------- apply batch */
@@ -250,20 +248,21 @@ static void check_retention(server_rec *s, apply_ctx_t *a,
     }
 }
 
-/* Caller holds the lock. */
-static void plen_merge(server_rec *s, crowdsec_server_rec *sconf,
-                       const unsigned char *key, plen_set_t *fresh, int full,
-                       apr_pool_t *p)
+/* An incremental batch adds to what is already known; a full pull replaces it,
+ * so prefix lengths that no longer exist stop being probed. Caller holds the
+ * lock.
+ */
+static void plen_merge(plen_set_t *dst, const plen_set_t *fresh, int full)
 {
-    plen_set_t existing;
     apr_size_t i;
 
-    if (!full && meta_get(s, sconf, key, &existing, sizeof(existing))) {
-        for (i = 0; i < sizeof(existing.bits); i++) {
-            fresh->bits[i] |= existing.bits[i];
-        }
+    if (full) {
+        *dst = *fresh;
+        return;
     }
-    meta_put(s, sconf, key, fresh, sizeof(*fresh), p);
+    for (i = 0; i < sizeof(dst->bits); i++) {
+        dst->bits[i] |= fresh->bits[i];
+    }
 }
 
 apr_status_t crowdsec_store_apply_stream(server_rec *s,
@@ -279,7 +278,7 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
     apr_status_t rv;
     int parsed;
 
-    if (!sconf->cache_instance) {
+    if (!sconf->cache_instance || !sconf->meta) {
         return APR_EINVAL;
     }
     memset(&a, 0, sizeof(a));
@@ -294,6 +293,25 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
         return rv;
     }
 
+    /* Another child may have claimed the lease while this pull was in flight.
+     * Applying now would write our older snapshot over the new leader's, so
+     * drop the batch instead. A zero holder means nobody is polling (the test
+     * entry point, or before any election), which is free to proceed.
+     */
+    {
+        lease_t lease;
+
+        lease = sconf->meta->lease;
+        if (lease.holder && lease.holder != (apr_int64_t) getpid()) {
+            store_unlock(sconf);
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, s,
+                         "crowdsec: discarding a decision batch pulled before "
+                         "the polling lease moved to pid %" APR_INT64_T_FMT,
+                         lease.holder);
+            return APR_EAGAIN;
+        }
+    }
+
     /* One lock for the whole batch: a startup pull is six figures of entries
      * and must not take six figures of locks.
      */
@@ -302,14 +320,14 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
 
     if (parsed) {
         memset(&st, 0, sizeof(st));
-        meta_get(s, sconf, key_stats, &st, sizeof(st));
+        st = sconf->meta->stats;
 
         /* Incremental batches add to what is already known. A full pull
          * rebuilds instead, so prefix lengths that no longer exist stop being
          * probed.
          */
-        plen_merge(s, sconf, key_plen4, &a.plens4, full, ptemp);
-        plen_merge(s, sconf, key_plen6, &a.plens6, full, ptemp);
+        plen_merge(&sconf->meta->plens4, &a.plens4, full);
+        plen_merge(&sconf->meta->plens6, &a.plens6, full);
 
         check_retention(s, &a, &st);
         st.last_pull = apr_time_now();
@@ -317,9 +335,8 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
         if (!st.primed_at) {
             st.primed_at = st.last_pull;
         }
-        meta_put(s, sconf, key_stats, &st, sizeof(st), ptemp);
-        meta_put(s, sconf, key_primed, &st.primed_at, sizeof(st.primed_at),
-                 ptemp);
+        sconf->meta->stats = st;
+        sconf->meta->primed_at = st.primed_at;
     }
 
     store_unlock(sconf);
@@ -344,7 +361,6 @@ static int store_probe(server_rec *s, crowdsec_server_rec *sconf,
                        crowdsec_rem_t *rem)
 {
     plen_set_t plens;
-    const unsigned char *meta_key;
     unsigned char key[CROWDSEC_KEY_MAX];
     decision_value_t val;
     apr_size_t keylen;
@@ -367,10 +383,7 @@ static int store_probe(server_rec *s, crowdsec_server_rec *sconf,
         return 1;
     }
 
-    meta_key = (host->family == 6) ? key_plen6 : key_plen4;
-    if (!meta_get(s, sconf, meta_key, &plens, sizeof(plens))) {
-        return 0;               /* nothing stored yet, so nothing to probe */
-    }
+    plens = (host->family == 6) ? sconf->meta->plens6 : sconf->meta->plens4;
 
     for (plen = width - 1; plen >= 0; plen--) {
         crowdsec_net_t net;
@@ -556,7 +569,7 @@ static crowdsec_lookup_t live_query(request_rec *r,
     crowdsec_http_req_t req;
     crowdsec_buf_t buf;
     crowdsec_http_err_t herr;
-    struct curl_slist *hdrs = NULL;
+    struct curl_slist **hdrs;
     long status = 0;
     char errbuf[256];
     const char *perr = NULL;
@@ -565,14 +578,20 @@ static crowdsec_lookup_t live_query(request_rec *r,
     if (!sconf->curl_handles) {
         return CROWDSEC_LOOKUP_FAIL;
     }
-    apr_pool_cleanup_register(r->pool, &hdrs,
+    /* The holder lives in the pool, not on the stack: this cleanup runs when
+     * the pool is destroyed, long after this function has returned, and a
+     * registered stack address would by then be a dead frame - handing
+     * curl_slist_free_all whatever happened to occupy it.
+     */
+    hdrs = apr_pcalloc(r->pool, sizeof(*hdrs));
+    apr_pool_cleanup_register(r->pool, hdrs,
                               crowdsec_http_headers_cleanup,
                               apr_pool_cleanup_null);
     if (sconf->key
-        && !crowdsec_http_header_add(r->pool, &hdrs, "X-Api-Key", sconf->key)) {
+        && !crowdsec_http_header_add(r->pool, hdrs, "X-Api-Key", sconf->key)) {
         return CROWDSEC_LOOKUP_FAIL;
     }
-    crowdsec_http_header_add_raw(&hdrs, "Accept:");
+    crowdsec_http_header_add_raw(hdrs, "Accept:");
 
     memset(&req, 0, sizeof(req));
     req.url = apr_pstrcat(r->pool, sconf->url, "/v1/decisions?ip=",
@@ -583,7 +602,7 @@ static crowdsec_lookup_t live_query(request_rec *r,
     req.low_speed_time = apr_time_from_sec(1);
     req.ceiling = CROWDSEC_CEILING_LIVE;
     req.ssl_verify = 1;
-    req.headers = hdrs;
+    req.headers = *hdrs;
 
     errbuf[0] = '\0';
     herr = crowdsec_http_exchange(sconf->curl_handles, &req, r->pool, &status,
@@ -657,7 +676,7 @@ crowdsec_lookup_t crowdsec_lapi_lookup(request_rec *r,
     }
 
     /* Stream mode. */
-    if (!sconf->cache_instance) {
+    if (!sconf->cache_instance || !sconf->meta) {
         return CROWDSEC_LOOKUP_FAIL;
     }
 
@@ -665,8 +684,8 @@ crowdsec_lookup_t crowdsec_lapi_lookup(request_rec *r,
         return CROWDSEC_LOOKUP_FAIL;
     }
     /* One lock for the primed check and the whole prefix walk. */
-    if (!meta_get(r->server, sconf, key_primed, &primed, sizeof(primed))
-        || !primed) {
+    primed = sconf->meta->primed_at;
+    if (!primed) {
         store_unlock(sconf);
         apr_table_setn(r->subprocess_env, "CROWDSEC_SOURCE", "unprimed");
         return CROWDSEC_LOOKUP_UNPRIMED;
@@ -692,8 +711,7 @@ crowdsec_lookup_t crowdsec_lapi_lookup(request_rec *r,
  * leader's lease goes stale and someone else claims it.
  */
 
-static int lease_claim(server_rec *s, crowdsec_server_rec *sconf,
-                       apr_pool_t *p, int *took_over)
+static int lease_claim(crowdsec_server_rec *sconf, int *took_over)
 {
     lease_t lease;
     apr_time_t now = apr_time_now();
@@ -704,17 +722,17 @@ static int lease_claim(server_rec *s, crowdsec_server_rec *sconf,
     *took_over = 0;
 
     /* Two intervals of silence is enough to call it: one missed tick could
-     * just be a slow pull.
+     * just be a slow pull, and a pull that runs longer than that keeps the
+     * lease warm itself through lease_heartbeat, so reaching this point really
+     * does mean the holder stopped running. Keeping the window short is what
+     * bounds failover after a child is killed.
      */
     stale = sconf->update_frequency * 2;
 
     if (store_lock(sconf) != APR_SUCCESS) {
         return 0;
     }
-    if (!meta_get(s, sconf, key_lease, &lease, sizeof(lease))) {
-        lease.holder = 0;
-        lease.last_run = 0;
-    }
+    lease = sconf->meta->lease;
 
     if (lease.holder == me) {
         leader = 1;
@@ -727,15 +745,14 @@ static int lease_claim(server_rec *s, crowdsec_server_rec *sconf,
     if (leader) {
         lease.holder = me;
         lease.last_run = now;
-        meta_put(s, sconf, key_lease, &lease, sizeof(lease), p);
+        sconf->meta->lease = lease;
     }
     store_unlock(sconf);
 
     return leader;
 }
 
-static void lease_release(server_rec *s, crowdsec_server_rec *sconf,
-                          apr_pool_t *p)
+static void lease_release(crowdsec_server_rec *sconf)
 {
     lease_t lease;
 
@@ -745,23 +762,68 @@ static void lease_release(server_rec *s, crowdsec_server_rec *sconf,
     /* Only drop it if it is still ours, so a child exiting late cannot evict
      * whoever took over from it.
      */
-    if (meta_get(s, sconf, key_lease, &lease, sizeof(lease))
-        && lease.holder == (apr_int64_t) getpid()) {
+    lease = sconf->meta->lease;
+    if (lease.holder == (apr_int64_t) getpid()) {
         lease.holder = 0;
         lease.last_run = 0;
-        meta_put(s, sconf, key_lease, &lease, sizeof(lease), p);
+        sconf->meta->lease = lease;
     }
     store_unlock(sconf);
+}
+
+/* Keeps the lease warm while a pull is running. Without this a startup pull
+ * of a large blocklist can outlast the staleness window and get itself
+ * declared dead mid-transfer; the alternative - widening the window to the
+ * worst-case pull budget - would stretch failover after a child is killed from
+ * two intervals to over a minute.
+ */
+typedef struct
+{
+    crowdsec_server_rec *sconf;
+    apr_int64_t me;
+    apr_time_t last_beat;
+} heartbeat_ctx_t;
+
+static int lease_heartbeat(void *data)
+{
+    heartbeat_ctx_t *hb = data;
+    apr_time_t now = apr_time_now();
+    int still_ours = 1;
+
+    /* curl calls this far more often than the lease needs touching, and each
+     * touch takes the global lock.
+     */
+    if (now - hb->last_beat < hb->sconf->update_frequency / 2) {
+        return 0;
+    }
+    hb->last_beat = now;
+
+    if (store_lock(hb->sconf) != APR_SUCCESS) {
+        return 0;
+    }
+    /* Only refresh what is still ours: if another child has taken over, say
+     * so by aborting rather than stealing the lease back mid-transfer.
+     */
+    if (hb->sconf->meta->lease.holder == hb->me) {
+        hb->sconf->meta->lease.last_run = now;
+    }
+    else {
+        still_ours = 0;
+    }
+    store_unlock(hb->sconf);
+
+    return still_ours ? 0 : 1;
 }
 
 static apr_status_t do_pull(server_rec *s, crowdsec_server_rec *sconf,
                             int full, apr_pool_t *ptemp)
 {
+    heartbeat_ctx_t hb;
     crowdsec_http_req_t req;
     crowdsec_buf_t buf;
     crowdsec_http_err_t herr;
     crowdsec_decision_stats_t dstats;
-    struct curl_slist *hdrs = NULL;
+    struct curl_slist **hdrs;
     long status = 0;
     char errbuf[256];
     apr_status_t rv;
@@ -769,13 +831,14 @@ static apr_status_t do_pull(server_rec *s, crowdsec_server_rec *sconf,
     if (!sconf->curl_handles) {
         return APR_EINVAL;
     }
-    apr_pool_cleanup_register(ptemp, &hdrs, crowdsec_http_headers_cleanup,
+    hdrs = apr_pcalloc(ptemp, sizeof(*hdrs));   /* see live_query */
+    apr_pool_cleanup_register(ptemp, hdrs, crowdsec_http_headers_cleanup,
                               apr_pool_cleanup_null);
     if (sconf->key
-        && !crowdsec_http_header_add(ptemp, &hdrs, "X-Api-Key", sconf->key)) {
+        && !crowdsec_http_header_add(ptemp, hdrs, "X-Api-Key", sconf->key)) {
         return APR_EINVAL;
     }
-    crowdsec_http_header_add_raw(&hdrs, "Accept:");
+    crowdsec_http_header_add_raw(hdrs, "Accept:");
 
     memset(&req, 0, sizeof(req));
     /* scopes is filtered server-side so Country and AS decisions never reach
@@ -795,7 +858,13 @@ static apr_status_t do_pull(server_rec *s, crowdsec_server_rec *sconf,
     req.low_speed_time = full ? apr_time_from_sec(30) : apr_time_from_sec(10);
     req.ceiling = CROWDSEC_CEILING_STREAM;
     req.ssl_verify = 1;
-    req.headers = hdrs;
+    req.headers = *hdrs;
+
+    hb.sconf = sconf;
+    hb.me = (apr_int64_t) getpid();
+    hb.last_beat = apr_time_now();
+    req.progress = lease_heartbeat;
+    req.progress_data = &hb;
 
     errbuf[0] = '\0';
     herr = crowdsec_http_exchange(sconf->curl_handles, &req, ptemp, &status,
@@ -859,6 +928,7 @@ static void *APR_THREAD_FUNC poller_main(apr_thread_t *thd, void *data)
     apr_pool_t *tpool;
     int was_leader = 0;
     int need_full = 1;
+    apr_time_t last_pull = 0;   /* 0 so the first wake pulls immediately */
 
     apr_pool_create(&tpool, apr_thread_pool_get(thd));
 
@@ -866,7 +936,7 @@ static void *APR_THREAD_FUNC poller_main(apr_thread_t *thd, void *data)
         apr_pool_t *ptemp;
         int leader, took_over;
 
-        leader = lease_claim(s, sconf, tpool, &took_over);
+        leader = lease_claim(sconf, &took_over);
 
         if (leader && !was_leader) {
             ap_log_error(APLOG_MARK, APLOG_INFO, 0, s,
@@ -883,14 +953,29 @@ static void *APR_THREAD_FUNC poller_main(apr_thread_t *thd, void *data)
              * idempotent - just more expensive, and only on takeover.
              */
             need_full = 1;
+            last_pull = 0;      /* and do it now, not an interval from now */
         }
         was_leader = leader;
 
-        if (leader) {
+        /* The lease is checked twice per interval so a stale one is noticed
+         * quickly, but pulling on every wake would double the configured
+         * rate, so the pull itself is gated on elapsed time.
+         */
+        if (leader && apr_time_now() - last_pull >= sconf->update_frequency) {
             apr_pool_create(&ptemp, tpool);
             if (do_pull(s, sconf, need_full, ptemp) == APR_SUCCESS) {
                 need_full = 0;
             }
+            else {
+                /* The engine advances its own stream cursor when it finishes
+                 * writing a response, so a batch we failed to read or parse is
+                 * gone for good: its additions and deletions would never be
+                 * resent to an incremental pull. Resync from a full snapshot
+                 * instead, which is idempotent and carries the deletions too.
+                 */
+                need_full = 1;
+            }
+            last_pull = apr_time_now();
             apr_pool_destroy(ptemp);
         }
 
@@ -913,7 +998,7 @@ static void *APR_THREAD_FUNC poller_main(apr_thread_t *thd, void *data)
     }
 
     if (was_leader) {
-        lease_release(s, sconf, tpool);
+        lease_release(sconf);
     }
     apr_pool_destroy(tpool);
     apr_thread_exit(thd, APR_SUCCESS);
@@ -932,6 +1017,24 @@ static apr_status_t poller_cleanup(void *data)
         sconf->poller = NULL;
     }
     return APR_SUCCESS;
+}
+
+/* True when another server_rec in this child already polls the same cache. */
+static int poller_exists_for_cache(server_rec *base,
+                                   const crowdsec_server_rec *want)
+{
+    server_rec *s;
+
+    for (s = base; s; s = s->next) {
+        const crowdsec_server_rec *other =
+            ap_get_module_config(s->module_config, &crowdsec_module);
+
+        if (other && other != want && other->poller
+            && other->cache_instance == want->cache_instance) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 apr_status_t crowdsec_poller_start(apr_pool_t *pchild, server_rec *base)
@@ -955,7 +1058,17 @@ apr_status_t crowdsec_poller_start(apr_pool_t *pchild, server_rec *base)
             continue;
         }
         if (sconf->poller) {
-            continue;           /* vhosts sharing a config share its poller */
+            continue;
+        }
+        /* One poller per decision cache, not per vhost. Vhosts that inherited
+         * the cache through the config merge each get their own server_rec, so
+         * a per-struct check alone would start a thread for every one of them
+         * - all in the same child, hence all with the same pid, so the lease
+         * would identify every one of them as the leader and they would pull
+         * and apply over each other.
+         */
+        if (poller_exists_for_cache(base, sconf)) {
+            continue;
         }
         sconf->poller_server = s;
         sconf->poller_stop = 0;
@@ -965,8 +1078,12 @@ apr_status_t crowdsec_poller_start(apr_pool_t *pchild, server_rec *base)
                          "crowdsec: could not start the stream poller thread");
             continue;
         }
-        apr_pool_cleanup_register(pchild, sconf, poller_cleanup,
-                                  apr_pool_cleanup_null);
+        /* A pre-cleanup, not an ordinary one: apr_pool_cleanup_register runs
+         * AFTER a pool's subpools are destroyed, and the thread's own pool is
+         * a subpool of pchild. Registering normally would free the pools the
+         * thread is still running on, then join it.
+         */
+        apr_pool_pre_cleanup_register(pchild, sconf, poller_cleanup);
     }
     return APR_SUCCESS;
 }

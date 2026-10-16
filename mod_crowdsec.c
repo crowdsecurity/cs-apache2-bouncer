@@ -232,6 +232,24 @@ static int crowdsec_fallback(request_rec *r, crowdsec_config_rec *conf,
     }
 }
 
+/* Set on every request_rec where this module actually reached a verdict.
+ * r->notes is per-request_rec - an internal redirect gets a fresh table - so
+ * walking r->prev distinguishes "already checked" from "never checked".
+ */
+#define CROWDSEC_NOTE_DECIDED "crowdsec-decided"
+
+static int decided_earlier(request_rec *r)
+{
+    request_rec *prev;
+
+    for (prev = r->prev; prev; prev = prev->prev) {
+        if (apr_table_get(prev->notes, CROWDSEC_NOTE_DECIDED)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int crowdsec_check_access(request_rec *r)
 {
     crowdsec_config_rec *conf = ap_get_module_config(r->per_dir_config,
@@ -242,21 +260,33 @@ static int crowdsec_check_access(request_rec *r)
     crowdsec_lookup_t lr;
     const char *ip;
 
-    /* A subrequest inherits the main request's decision, and an internal
-     * redirect (an ErrorDocument, say) has already been decided on.
+    /* A subrequest is covered by the main request. */
+    if (r->main) {
+        return DECLINED;
+    }
+    /* An internal redirect inherits a verdict only if one was actually
+     * reached. A RewriteRule out of an unprotected scope into a protected one
+     * arrives here with r->prev set and nothing checked, so declining on
+     * r->prev alone would hand the target over unchecked. An ErrorDocument
+     * follows a request we did decide, so it still short-circuits here.
      */
-    if (r->main || r->prev) {
+    if (r->prev && decided_earlier(r)) {
         return DECLINED;
     }
     if (!conf->enable || !sconf || !sconf->url) {
         return DECLINED;
     }
     /* A forward-proxy request is a different threat model and r->unparsed_uri
-     * means something else there.
+     * means something else there. Reverse-proxied requests are deliberately
+     * NOT excluded: ProxyPass sets PROXYREQ_REVERSE from translate_name, which
+     * runs before this hook, so skipping them would leave every Apache acting
+     * as a reverse proxy - a primary deployment for this module - with no
+     * decision lookup at all.
      */
-    if (r->proxyreq != PROXYREQ_NONE || r->method_number == M_CONNECT) {
+    if (r->proxyreq == PROXYREQ_PROXY || r->method_number == M_CONNECT) {
         return DECLINED;
     }
+    apr_table_setn(r->notes, CROWDSEC_NOTE_DECIDED, "1");
 
     ip = crowdsec_client_ip(r, conf);
     if (!ip) {
@@ -351,7 +381,12 @@ static int crowdsec_post_config(apr_pool_t *pconf, apr_pool_t *plog,
             ap_get_module_config(s_vhost->module_config, &crowdsec_module);
         apr_status_t status;
 
-        if (sconf->cache_provider_set) {
+        /* Only the server_rec that created the instance sets it up. A vhost
+         * that inherited the pointer through the config merge would otherwise
+         * re-init the same shmcb segment, guard it with a second mutex that
+         * excludes nothing, and destroy it again at shutdown.
+         */
+        if (sconf->cache_owned) {
             status = ap_global_mutex_create(&sconf->cache_mutex, NULL,
                                             crowdsec_id, NULL, s_vhost, pconf,
                                             0);
@@ -373,6 +408,14 @@ static int crowdsec_post_config(apr_pool_t *pconf, apr_pool_t *plog,
             }
             apr_pool_cleanup_register(pconf, s_vhost, cleanup_cache,
                                       apr_pool_cleanup_null);
+
+            status = crowdsec_meta_create(pconf, sconf);
+            if (status != APR_SUCCESS) {
+                ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog,
+                              "failed to create the %s shared control region",
+                              crowdsec_id);
+                return 500;
+            }
         }
 
         if (!sconf->url) {
@@ -402,12 +445,47 @@ static int crowdsec_post_config(apr_pool_t *pconf, apr_pool_t *plog,
                          "set, or use CrowdsecTrustUseragentIP off");
         }
     }
+
+    /* A vhost that inherited the cache pointer has no mutex of its own, and
+     * store_lock treats a NULL mutex as "nothing to lock" - so without this it
+     * would read and write the shared segment unsynchronised. Hand it the
+     * owner's mutex, and refuse to start if there is somehow no owner rather
+     * than run unlocked.
+     */
+    for (s_vhost = s; s_vhost; s_vhost = s_vhost->next) {
+        crowdsec_server_rec *sconf =
+            ap_get_module_config(s_vhost->module_config, &crowdsec_module);
+        server_rec *owner;
+
+        if (!sconf->cache_instance || sconf->cache_mutex) {
+            continue;
+        }
+        for (owner = s; owner; owner = owner->next) {
+            crowdsec_server_rec *oconf =
+                ap_get_module_config(owner->module_config, &crowdsec_module);
+
+            if (oconf->cache_owned
+                && oconf->cache_instance == sconf->cache_instance) {
+                sconf->cache_mutex = oconf->cache_mutex;
+                sconf->meta_shm = oconf->meta_shm;
+                sconf->meta = oconf->meta;
+                break;
+            }
+        }
+        if (!sconf->cache_mutex) {
+            ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
+                         "crowdsec: the decision cache has no owning server; "
+                         "refusing to use it without a lock");
+            return 500;
+        }
+    }
     return OK;
 }
 
 static void crowdsec_child_init(apr_pool_t *pchild, server_rec *s)
 {
     server_rec *s_vhost;
+    apr_reslist_t *handles = NULL;
     int threads = 1;
 
     /* curl_global_init is documented as not thread-safe and sets up TLS
@@ -426,6 +504,19 @@ static void crowdsec_child_init(apr_pool_t *pchild, server_rec *s)
         threads = 1;
     }
 
+    /* One pool for the whole child, not one per vhost. The handles carry no
+     * per-vhost state - every option is set per exchange - so a pool each
+     * would multiply the handle count by the number of vhosts for no gain.
+     * Sized at one handle per worker thread, so acquiring one can never block
+     * and turn engine latency into a stalled request.
+     */
+    if (crowdsec_http_pool_create(pchild, threads, &handles) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s,
+                     "crowdsec: could not create the curl handle pool; this "
+                     "child will apply CrowdsecFallback to every request");
+        return;
+    }
+
     for (s_vhost = s; s_vhost; s_vhost = s_vhost->next) {
         crowdsec_server_rec *sconf =
             ap_get_module_config(s_vhost->module_config, &crowdsec_module);
@@ -433,15 +524,7 @@ static void crowdsec_child_init(apr_pool_t *pchild, server_rec *s)
         if (!sconf->url || sconf->curl_handles) {
             continue;           /* vhosts sharing a config share its handles */
         }
-        /* One handle per worker thread, so acquiring one can never block and
-         * turn engine latency into a stalled request.
-         */
-        if (crowdsec_http_pool_create(pchild, threads,
-                                      &sconf->curl_handles) != APR_SUCCESS) {
-            ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
-                         "crowdsec: could not create the curl handle pool");
-            continue;
-        }
+        sconf->curl_handles = handles;
         if (crowdsec_memo_init(pchild, sconf) != APR_SUCCESS) {
             ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
                          "crowdsec: could not create the decision memo");
@@ -809,6 +892,11 @@ static const char *set_crowdsec_cache(cmd_parms *cmd, void *dconf,
         return apr_psprintf(cmd->pool, "CrowdsecCache: %s", errmsg);
     }
     sconf->cache_provider_set = 1;
+    /* This server_rec created the instance, so it is the one that initialises
+     * and destroys it. merge_crowdsec_server_config deliberately does not
+     * propagate this bit.
+     */
+    sconf->cache_owned = 1;
 
     return NULL;
 }
@@ -845,9 +933,10 @@ static const command_rec crowdsec_cmds[] = {
     AP_INIT_TAKE1("CrowdsecRemediationFallback",
                   set_crowdsec_remediation_fallback, NULL,
                   RSRC_CONF | ACCESS_CONF,
-                  "What a remediation this component cannot serve (captcha, or "
-                  "one defined by the administrator) becomes: ban or allow. "
-                  "Default ban."),
+                  "What an AppSec remediation this component cannot serve "
+                  "(captcha, or one defined by the administrator) becomes: ban "
+                  "or allow. Default ban. Does not apply to local API "
+                  "decisions, which are always enforced as a ban."),
     AP_INIT_TAKE1("CrowdsecLocation", set_crowdsec_location, NULL,
                   RSRC_CONF | ACCESS_CONF,
                   "URL or path to redirect a blocked client to. Supports "

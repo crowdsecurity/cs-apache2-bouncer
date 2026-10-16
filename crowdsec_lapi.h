@@ -28,6 +28,13 @@ typedef struct
     apr_uint32_t leader_changes;
 } crowdsec_store_stats_t;
 
+/* Creates the shared control region (lease, primed flag, statistics, prefix
+ * bitmaps). Called from post_config for the server that owns the cache; the
+ * others are handed the same pointer.
+ */
+apr_status_t crowdsec_meta_create(apr_pool_t *pconf,
+                                  crowdsec_server_rec *sconf);
+
 apr_status_t crowdsec_memo_init(apr_pool_t *pchild, crowdsec_server_rec *sconf);
 
 /* Answers from the memo, then the shared cache (stream) or LAPI (live). */

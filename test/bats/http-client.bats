@@ -7,8 +7,10 @@ load "../lib/harness.sh"
 
 setup() {
     harness_init
-    T_HTTP="${T_HTTP:-/tmp/t_http}"
-    [ -x "$T_HTTP" ] || skip "t_http not built"
+    # Default to where make check builds it, not /tmp: a clean in-tree build
+    # would otherwise skip this whole suite, or run a stale leftover binary.
+    T_HTTP="${T_HTTP:-$(cd "$BATS_TEST_DIRNAME/../.." && pwd)/test/unit/t_http}"
+    [ -x "$T_HTTP" ] || skip "t_http not built (run make check)"
 }
 
 teardown() {

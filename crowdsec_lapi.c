@@ -103,11 +103,22 @@ int crowdsec_store_stats(server_rec *s, crowdsec_server_rec *sconf,
 
 /* ------------------------------------------------------------- apply batch */
 
+/* How many stores to apply per hold of the global mutex. Request lookups need
+ * the same mutex, so a full pull held for its whole six-figure batch would
+ * stall every request in every child for the duration. At ~1us per store a
+ * slice is a few milliseconds.
+ */
+#define APPLY_CHUNK_OPS 4096
+
 typedef struct
 {
     server_rec *s;
     crowdsec_server_rec *sconf;
     apr_pool_t *p;
+    apr_int64_t me;             /* our pid, for the lease re-check */
+    apr_size_t ops;             /* stores and removals since the last yield */
+    unsigned int locked:1;      /* cleared if a re-take of the lock fails */
+    unsigned int lease_lost:1;  /* another child took over mid-batch */
     /* One set per family: a v4 lookup must not be made to probe prefix
      * lengths that only v6 decisions use, and each probe costs a socache read
      * under the global lock.
@@ -125,6 +136,31 @@ typedef struct
     apr_size_t sample_every;
 } apply_ctx_t;
 
+/* Releases and retakes the lock so request lookups can interleave with a
+ * large batch. The lease is re-checked on the way back in - the pre-batch
+ * check only covers the moment the batch began - and kept warm, so a long
+ * apply cannot be declared stale by another child.
+ */
+static apr_status_t apply_yield(apply_ctx_t *a)
+{
+    lease_t lease;
+
+    crowdsec_store_unlock(a->sconf);
+    if (crowdsec_store_lock(a->sconf) != APR_SUCCESS) {
+        a->locked = 0;
+        return APR_EGENERAL;
+    }
+    lease = a->sconf->meta->lease;
+    if (lease.holder && lease.holder != a->me) {
+        a->lease_lost = 1;
+        return APR_EAGAIN;
+    }
+    if (lease.holder == a->me) {
+        a->sconf->meta->lease.last_run = apr_time_now();
+    }
+    return APR_SUCCESS;
+}
+
 static apr_status_t apply_one(void *ctx, int added,
                               const crowdsec_decision_t *d)
 {
@@ -132,6 +168,16 @@ static apr_status_t apply_one(void *ctx, int added,
     unsigned char key[CROWDSEC_KEY_MAX];
     apr_size_t keylen;
     decision_value_t val;
+
+    if (++a->ops >= APPLY_CHUNK_OPS) {
+        apr_status_t rv;
+
+        a->ops = 0;
+        rv = apply_yield(a);
+        if (rv != APR_SUCCESS) {
+            return rv;
+        }
+    }
 
     keylen = crowdsec_key_encode(&d->net, key, sizeof(key));
     if (!keylen) {
@@ -257,6 +303,7 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
     a.s = s;
     a.sconf = sconf;
     a.p = ptemp;
+    a.me = (apr_int64_t) getpid();
     /* Sample roughly 1% of what we write, capped at 32 probes. */
     a.sample_every = 100;
 
@@ -264,6 +311,7 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
     if (rv != APR_SUCCESS) {
         return rv;
     }
+    a.locked = 1;
 
     /* Another child may have claimed the lease while this pull was in flight.
      * Applying now would write our older snapshot over the new leader's, so
@@ -284,8 +332,9 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
         }
     }
 
-    /* One lock for the whole batch: a startup pull is six figures of entries
-     * and must not take six figures of locks.
+    /* The lock is held in slices of APPLY_CHUNK_OPS stores - see apply_yield -
+     * so a startup pull neither takes six figures of locks nor starves every
+     * request lookup for the whole apply.
      */
     parsed = crowdsec_stream_parse(body, len, ptemp, apply_one, &a, stats,
                                    &err);
@@ -311,9 +360,20 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
         sconf->meta->primed_at = st.primed_at;
     }
 
-    crowdsec_store_unlock(sconf);
+    if (a.locked) {
+        crowdsec_store_unlock(sconf);
+    }
 
     if (!parsed) {
+        if (a.lease_lost) {
+            /* The entries already stored are harmless: stores are idempotent
+             * and the new leader starts from a full pull anyway.
+             */
+            ap_log_error(APLOG_MARK, APLOG_INFO, 0, s,
+                         "crowdsec: the polling lease moved to another child "
+                         "mid-batch; discarding the rest of this one");
+            return APR_EAGAIN;
+        }
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
                      "crowdsec: could not parse the decision stream: %s",
                      err ? err : "unknown");

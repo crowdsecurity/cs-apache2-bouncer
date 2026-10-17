@@ -81,6 +81,24 @@ Crowdsec On"
     [ "$(http_status)" = 500 ]
 }
 
+@test "the per-child memo cannot outlive the shared entry it came from" {
+    # Live mode chains two caches: the shared one, then a per-child memo seeded
+    # from it. An uncapped memo keeps serving a verdict after the shared entry
+    # it was copied from has expired, making the worst case twice
+    # CrowdsecCacheTimeout. The memo is capped at the shared lifetime, so
+    # asking for 60s here yields 1s.
+    lapi_set '{"live":null}'
+    apache_start "$(live_conf '
+CrowdsecCacheTimeout 1s
+CrowdsecLocalCacheTimeout 60s')"
+
+    run python3 "$BATS_TEST_DIRNAME/../lib/memo_probe.py" \
+        "$APACHE_PORT" "$LAPI_STATE" \
+        "{\"live\":[$(decision 127.0.0.1 Ip)]}"
+    [[ "$output" == *"first=200"* ]]
+    [[ "$output" == *"blocked=True"* ]]
+}
+
 @test "a verdict is cached across child processes, not just in one" {
     # Without a shared cache each child would query the API for the same
     # client, multiplying API traffic by the number of children. Requests go

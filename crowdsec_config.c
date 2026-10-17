@@ -83,6 +83,7 @@ void *create_crowdsec_server_config(apr_pool_t *p, server_rec *s)
     crowdsec_server_rec *conf = apr_pcalloc(p, sizeof(crowdsec_server_rec));
 
     conf->cache_timeout = CROWDSEC_CACHE_TIMEOUT_DEFAULT;
+    conf->local_cache_timeout = CROWDSEC_LOCAL_CACHE_TIMEOUT_DEFAULT;
     conf->update_frequency = CROWDSEC_UPDATE_FREQ_DEFAULT;
     conf->connect_timeout = CROWDSEC_CONNECT_TIMEOUT_DEFAULT;
     conf->timeout = CROWDSEC_TIMEOUT_DEFAULT;
@@ -109,6 +110,7 @@ void *merge_crowdsec_server_config(apr_pool_t *p, void *basev,
     MERGE(connect_timeout);
     MERGE(timeout);
     MERGE(cache_timeout);
+    MERGE(local_cache_timeout);
     MERGE(appsec_path);
     MERGE(appsec_connect_timeout);
     MERGE(appsec_timeout);
@@ -418,6 +420,24 @@ static const char *set_crowdsec_cache(cmd_parms *cmd, void *dconf,
     return NULL;
 }
 
+static const char *set_crowdsec_local_cache_timeout(cmd_parms *cmd,
+                                                   void *dconf,
+                                                   const char *arg)
+{
+    crowdsec_server_rec *sconf =
+        ap_get_module_config(cmd->server->module_config, &crowdsec_module);
+    const char *err = parse_interval(cmd, arg, "CrowdsecLocalCacheTimeout",
+                                     apr_time_from_sec(86400),
+                                     &sconf->local_cache_timeout);
+
+    if (err) {
+        return err;
+    }
+    sconf->local_cache_timeout_set = 1;
+
+    return NULL;
+}
+
 static const char *set_crowdsec_cache_timeout(cmd_parms *cmd, void *dconf,
                                               const char *arg)
 {
@@ -697,6 +717,15 @@ const command_rec crowdsec_cmds[] = {
                   RSRC_CONF,
                   "How long one address's verdict is remembered in-process. "
                   "Default 60s."),
+    AP_INIT_TAKE1("CrowdsecLocalCacheTimeout",
+                  set_crowdsec_local_cache_timeout, NULL, RSRC_CONF,
+                  "How long one address's verdict is held in a single Apache "
+                  "child, in front of the shared cache. Default 2s. This is "
+                  "added to CrowdsecUpdateFrequency in the time a new decision "
+                  "takes to apply, so keep it small; it exists to keep the "
+                  "shared cache's global lock off the hot path for repeat "
+                  "visitors, which needs no more than a fraction of a poll "
+                  "interval. Capped at CrowdsecCacheTimeout."),
     AP_INIT_TAKE1("CrowdsecAppsecURL", set_crowdsec_appsec_url, NULL,
                   RSRC_CONF,
                   "Address of the AppSec component, e.g. "

@@ -21,6 +21,7 @@
 #include "crowdsec_internal.h"
 
 #define CROWDSEC_CACHE_TIMEOUT_DEFAULT  apr_time_from_sec(60)
+#define CROWDSEC_LOCAL_CACHE_TIMEOUT_DEFAULT apr_time_from_sec(2)
 #define CROWDSEC_UPDATE_FREQ_DEFAULT    apr_time_from_sec(10)
 #define CROWDSEC_CONNECT_TIMEOUT_DEFAULT apr_time_from_sec(1)
 #define CROWDSEC_TIMEOUT_DEFAULT        apr_time_from_sec(5)
@@ -109,6 +110,7 @@ typedef struct
     apr_interval_time_t connect_timeout;
     apr_interval_time_t timeout;
     apr_interval_time_t cache_timeout;
+    apr_interval_time_t local_cache_timeout;
 
     /* appsec endpoint */
     const char *appsec_url;
@@ -155,6 +157,7 @@ typedef struct
     unsigned int timeout_set:1;
     unsigned int cache_provider_set:1;
     unsigned int cache_timeout_set:1;
+    unsigned int local_cache_timeout_set:1;
     unsigned int appsec_url_set:1;
     unsigned int appsec_path_set:1;
     unsigned int appsec_connect_timeout_set:1;

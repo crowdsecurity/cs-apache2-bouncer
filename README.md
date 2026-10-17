@@ -192,7 +192,8 @@ Scope column: **S** = server/vhost only, **S+D** = also valid in
 | `CrowdsecMode` | S | `live` | `live` or `stream`. `stream` requires `CrowdsecCache`. |
 | `CrowdsecUpdateFrequency` | S | `10s` | Decision stream poll interval. |
 | `CrowdsecCache` | S | — | Shared decision cache, e.g. `shmcb:crowdsec(16777216)`. Required by stream mode. Budget ~128 bytes per decision: 100,000 decisions need at least 6 MB, 1,000,000 fit in 128 MB. Undersized, decisions are evicted and those clients go unblocked; the error log reports it after each pull. |
-| `CrowdsecCacheTimeout` | S | `60s` | How long one address's verdict is remembered in-process. Governs how long a new decision can take to take effect — see [Known limits](#known-limits). |
+| `CrowdsecCacheTimeout` | S | `60s` | How long one address's verdict is held in the **shared** cache. Live mode only: it is what stops every child querying the API for the same client. |
+| `CrowdsecLocalCacheTimeout` | S | `2s` | How long one address's verdict is held **within a single Apache child**, in front of the shared cache. Added to `CrowdsecUpdateFrequency` in the time a new decision takes to apply, so keep it small. Capped at `CrowdsecCacheTimeout`. |
 | `CrowdsecConnectTimeout` | S | `1s` | Connection timeout to the local API. |
 | `CrowdsecTimeout` | S | `5s` | Total budget for one API request. A stream pull gets a multiple of this. |
 
@@ -243,19 +244,18 @@ a ban rather than being served.
 **A new decision is not instant**, and the delay differs by mode.
 
 In `stream` mode the worst case is `CrowdsecUpdateFrequency` +
-`CrowdsecCacheTimeout` — **70s** with the defaults. A request arriving just
-before the poller picks the decision up misses the shared store, caches an
-allow in that child's in-process memo, and is served from it until the memo
-expires. It is per child: others block as soon as the pull lands.
+`CrowdsecLocalCacheTimeout` — **12s** with the defaults. A request arriving just
+before the poller picks the decision up misses the shared store and caches an
+allow in that child's memo, and is served from it until the memo expires. It is
+per child: others block as soon as the pull lands.
 
-In `live` mode the worst case is **2 × `CrowdsecCacheTimeout`** — **120s** with
-the defaults. The shared cache and the per-child memo chain: a child reading an
-already-aging shared entry copies the stale verdict into its own memo with a
-full fresh TTL, because `ap_socache` does not report how much life the shared
-entry had left.
+In `live` mode the worst case is `CrowdsecCacheTimeout` +
+`CrowdsecLocalCacheTimeout` — **62s** with the defaults, because the shared
+entry and the memo seeded from it expire independently.
 
-Lower `CrowdsecCacheTimeout` for faster propagation, at the cost of more cache
-reads and, in live mode, more API queries.
+`CrowdsecLocalCacheTimeout` is the knob for propagation speed; it costs only
+extra shared-cache reads. `CrowdsecCacheTimeout` governs API traffic in live
+mode, so lowering that one makes every child query the API more often.
 
 **One child pays for the stream pull.** The child holding the polling lease
 allocates roughly 4.6× the stream body size while applying it, and keeps that

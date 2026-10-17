@@ -439,6 +439,7 @@ static void memo_put(crowdsec_server_rec *sconf, const char *ip,
                      crowdsec_rem_t rem)
 {
     crowdsec_memo_slot_t *slot;
+    apr_interval_time_t ttl;
 
     if (!sconf->memo.slots || strlen(ip) > CROWDSEC_IP_MAX) {
         return;
@@ -452,7 +453,20 @@ static void memo_put(crowdsec_server_rec *sconf, const char *ip,
     slot = &sconf->memo.slots[memo_hash(ip)];
     apr_cpystrn(slot->ip, ip, sizeof(slot->ip));
     slot->rem = rem;
-    slot->expiry = apr_time_now() + sconf->cache_timeout;
+    /* The per-child lifetime, not the shared cache's: this is added to
+     * CrowdsecUpdateFrequency in the time a new decision takes to apply, and
+     * it only has to be long enough to keep the shared cache's global lock off
+     * the hot path for a repeat visitor.
+     *
+     * Capped at the shared lifetime because a memo entry can be seeded from an
+     * already-aging shared one, and a longer memo would then keep serving a
+     * verdict after the entry it came from had gone.
+     */
+    ttl = sconf->local_cache_timeout;
+    if (ttl > sconf->cache_timeout) {
+        ttl = sconf->cache_timeout;
+    }
+    slot->expiry = apr_time_now() + ttl;
     slot->used = 1;
     if (sconf->memo.mutex) {
         apr_thread_mutex_unlock(sconf->memo.mutex);

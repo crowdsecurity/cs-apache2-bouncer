@@ -71,6 +71,31 @@ CONF
     [ "$(http_status)" = 200 ]
 }
 
+@test "a cached allow does not outlive the poll interval by much" {
+    # The per-child memo caches the ALLOW for an address probed before the
+    # decision lands. It must expire on CrowdsecLocalCacheTimeout, not on
+    # CrowdsecCacheTimeout - a 60s shared lifetime here, which is the realistic
+    # shape, would otherwise keep serving the stale allow for a full minute.
+    lapi_set '{"decisions":[],"sticky":true}'
+    apache_start "CrowdsecMode stream
+CrowdsecUpdateFrequency 1s
+CrowdsecCache $BIG_CACHE
+CrowdsecCacheTimeout 60s
+CrowdsecLocalCacheTimeout 1s
+CrowdsecFallback allow
+Crowdsec On"
+    wait_primed
+    [ "$(http_status)" = 200 ]          # warms an allow into this child's memo
+
+    lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip)],\"sticky\":true}"
+    # bound is CrowdsecUpdateFrequency + CrowdsecLocalCacheTimeout = 2s
+    for _ in $(seq 16); do
+        [ "$(http_status)" = 429 ] && break
+        sleep 0.5
+    done
+    [ "$(http_status)" = 429 ]
+}
+
 @test "deleting a decision unblocks the address" {
     lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip)],\"sticky\":true}"
     apache_start "$(stream_conf)"
@@ -80,7 +105,8 @@ CONF
     # stop repeating the ban, and report it as deleted
     lapi_set "{\"decisions\":[],\"deleted\":[$(decision 127.0.0.1 Ip)]}"
     sleep 3
-    # the in-process memo has a 1s ttl, so this is the cache being updated
+    # CrowdsecLocalCacheTimeout caps the per-child memo at 1s here, so what
+    # is being observed is the shared cache being updated
     [ "$(http_status)" = 200 ]
 }
 

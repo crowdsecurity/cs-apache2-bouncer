@@ -122,6 +122,32 @@ static apr_status_t capture_body(request_rec *r, crowdsec_req_rec *st,
      * limit allows, and we know that without having thrown anything away.
      */
     budget = cap + 1;
+
+    /* Seed the buffer from the declared length, so a typical body allocates
+     * once instead of doubling through up to eight full copies. A length that
+     * lies only costs a wrong initial size: growth and the budget still
+     * govern, and HTTP_IN has already validated the header by the time it
+     * produces body bytes.
+     */
+    {
+        const char *cl = apr_table_get(r->headers_in, "Content-Length");
+        apr_off_t hint;
+        char *end;
+
+        if (cl && *cl >= '0' && *cl <= '9'
+            && apr_strtoff(&hint, cl, &end, 10) == APR_SUCCESS
+            && !*end && hint > 0) {
+            if (hint > budget) {
+                hint = budget;
+            }
+            alloc = (apr_size_t) hint + 1;      /* +1 for the NUL we keep */
+            st->body = apr_palloc(r->pool, alloc);
+            if (!st->body) {
+                return APR_ENOMEM;
+            }
+        }
+    }
+
     bb = apr_brigade_create(r->pool, r->connection->bucket_alloc);
 
     for (;;) {

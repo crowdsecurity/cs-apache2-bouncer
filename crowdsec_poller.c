@@ -241,16 +241,42 @@ static apr_status_t do_pull(server_rec *s, crowdsec_server_rec *sconf,
     return APR_SUCCESS;
 }
 
+/* How much freed memory the poller's allocator may keep between pulls. Enough
+ * to recycle the small per-pull buffers, far below a parse arena.
+ */
+#define POLLER_POOL_MAX_FREE (4 * 1024 * 1024)
+
 static void *APR_THREAD_FUNC poller_main(apr_thread_t *thd, void *data)
 {
     crowdsec_server_rec *sconf = data;
     server_rec *s = sconf->poller_server;
-    apr_pool_t *tpool;
+    apr_allocator_t *alc = NULL;
+    apr_pool_t *tpool = NULL;
     int was_leader = 0;
     int need_full = 1;
     apr_time_t last_pull = 0;   /* 0 so the first wake pulls immediately */
 
-    apr_pool_create(&tpool, apr_thread_pool_get(thd));
+    /* Our own bounded allocator, not the thread pool's: that one is shared up
+     * the pool tree and never returns freed memory to the OS, so the parse
+     * arena of one large startup pull - sized at roughly 9x the body - would
+     * inflate this child's footprint for the rest of its life. No mutex is
+     * set because only this thread allocates from it.
+     */
+    if (apr_allocator_create(&alc) == APR_SUCCESS) {
+        apr_allocator_max_free_set(alc, POLLER_POOL_MAX_FREE);
+        if (apr_pool_create_ex(&tpool, apr_thread_pool_get(thd), NULL, alc)
+            == APR_SUCCESS) {
+            /* The pool owns the allocator, so destroying it below frees both. */
+            apr_allocator_owner_set(alc, tpool);
+        }
+        else {
+            apr_allocator_destroy(alc);
+            tpool = NULL;
+        }
+    }
+    if (!tpool) {
+        apr_pool_create(&tpool, apr_thread_pool_get(thd));
+    }
 
     while (!sconf->poller_stop) {
         apr_pool_t *ptemp;

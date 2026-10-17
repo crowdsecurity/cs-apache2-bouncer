@@ -146,7 +146,6 @@ typedef struct
     volatile int poller_stop;
     apr_thread_t *poller;
     server_rec *poller_server;
-    unsigned int curl_ok:1;
 
     /* --- explicitly-set bits, for the merge --- */
     unsigned int url_set:1;

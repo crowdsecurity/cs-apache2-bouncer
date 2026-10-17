@@ -737,9 +737,7 @@ static void crowdsec_child_init(apr_pool_t *pchild, server_rec *s)
         if (crowdsec_memo_init(pchild, sconf) != APR_SUCCESS) {
             ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
                          "crowdsec: could not create the decision memo");
-            continue;
         }
-        sconf->curl_ok = 1;
     }
 
     crowdsec_poller_start(pchild, s);

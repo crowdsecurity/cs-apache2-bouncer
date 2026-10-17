@@ -316,8 +316,14 @@ static int crowdsec_check_access(request_rec *r)
      * runs before this hook, so skipping them would leave every Apache acting
      * as a reverse proxy - a primary deployment for this module - with no
      * decision lookup at all.
+     *
+     * Keyed on proxyreq alone, not on M_CONNECT: with ProxyRequests off a
+     * CONNECT is not a proxy request - Apache leaves proxyreq as
+     * PROXYREQ_NONE and resolves the target against the document root - so
+     * declining on the method let a banned client swap GET for CONNECT and be
+     * served local content with no lookup and no inspection.
      */
-    if (r->proxyreq == PROXYREQ_PROXY || r->method_number == M_CONNECT) {
+    if (r->proxyreq == PROXYREQ_PROXY) {
         return DECLINED;
     }
 

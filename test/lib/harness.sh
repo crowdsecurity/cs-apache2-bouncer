@@ -246,6 +246,27 @@ CONF
 }
 
 # Echoes the status code for GET /.
+# Sends bytes verbatim and prints the response. curl cannot produce an
+# authority-form request line, which is the shape the CONNECT gating test needs.
+raw_request() {
+    python3 - "$APACHE_PORT" "$1" <<'PYEOF'
+import socket, sys
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=10)
+s.sendall(sys.argv[2].encode())
+out = b""
+while True:
+    try:
+        c = s.recv(65536)
+    except socket.timeout:
+        break
+    if not c:
+        break
+    out += c
+s.close()
+sys.stdout.write(out.decode("latin1", "replace"))
+PYEOF
+}
+
 http_status() {
     curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
         "http://127.0.0.1:$APACHE_PORT/${1:-}"

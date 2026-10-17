@@ -93,6 +93,10 @@ Crowdsec On"
         [ "$(http_status)" = 429 ] && break
         sleep 0.5
     done
+    # The 429 above proves one child enforced, but a sibling child's memo can
+    # hold the pre-ban allow for up to CrowdsecLocalCacheTimeout after that.
+    # Let it lapse, then any child must agree.
+    sleep 1.1
     [ "$(http_status)" = 429 ]
 }
 

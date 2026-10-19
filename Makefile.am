@@ -30,10 +30,22 @@ APXS_ARGS = -c -o @srcdir@/mod_crowdsec.la \
 EXTRA_DIST = $(CROWDSEC_SRC) $(CROWDSEC_HDRS) \
              vendor/yyjson/yyjson.c vendor/yyjson/yyjson.h \
              vendor/yyjson/LICENSE vendor/yyjson/VERSION \
-             test/README.md test/lib/harness.sh test/lib/stub_endpoint.py \
+             test/README.md test/lib/harness.sh \
+             test/lib/stub_endpoint.py test/lib/stub_lapi.py \
+             test/lib/stub_appsec.py test/lib/memo_probe.py \
              test/unit/t_util.c test/unit/t_verdict.c test/unit/t_http.c \
              test/unit/mod_scan_conformance.c \
-             scripts/version.sh
+             test/bats/appsec.bats test/bats/appsec-body.bats \
+             test/bats/blocked-http-code.bats test/bats/challenge.bats \
+             test/bats/connect.bats test/bats/gating.bats \
+             test/bats/http-client.bats test/bats/limits.bats \
+             test/bats/live-mode.bats test/bats/scan-conformance.bats \
+             test/bats/stream-mode.bats \
+             fuzz/README.md \
+             scripts/version.sh scripts/_bouncer.sh \
+             config/crowdsec-apache2-bouncer.conf \
+             config/mod_crowdsec.load.in config/mod_crowdsec.conf.in \
+             config/10-crowdsec.conf.in config/crowdsec-include.conf.in
 
 @srcdir@/vendor/yyjson/yyjson.lo: @srcdir@/vendor/yyjson/yyjson.c \
                                   @srcdir@/vendor/yyjson/yyjson.h
@@ -51,6 +63,42 @@ install-exec-local: @srcdir@/vendor/yyjson/yyjson.lo
 	mkdir -p $(DESTDIR)$${LIBEXECDIR}; \
 	\
 	$(APXS) -S LIBEXECDIR=$(DESTDIR)$${LIBEXECDIR} -i $(APXS_ARGS)
+
+# The bouncer's own files, independent of which apache layout is in use. Kept
+# separate from install-apache-snippets because the Debian package takes this
+# half only: there dh_apache2 owns the .so and the mods-available pair, and it
+# is what emits the apache2-api dependency.
+install-bouncer-data:
+	$(MKDIR_P) $(DESTDIR)@CROWDSEC_CONFDIR@
+# 0600 because this file holds the API key. scripts/_bouncer.sh writes it with
+# a plain redirect under umask 177, which preserves whatever mode the file
+# already has rather than imposing one - so the packaging has to create it
+# with the right mode in the first place.
+	$(INSTALL) -m 0600 $(srcdir)/config/crowdsec-apache2-bouncer.conf \
+	    $(DESTDIR)@CROWDSEC_CONFDIR@/crowdsec-apache2-bouncer.conf
+	$(MKDIR_P) $(DESTDIR)@BOUNCER_LIBDIR@
+	$(INSTALL) -m 0600 $(srcdir)/scripts/_bouncer.sh \
+	    $(DESTDIR)@BOUNCER_LIBDIR@/_bouncer.sh
+
+# These come from config.status, so they are in the build tree and take no
+# $(srcdir).
+install-apache-snippets:
+if LAYOUT_DEBIAN
+	$(MKDIR_P) $(DESTDIR)@APACHE_CONFROOT@/mods-available
+	$(INSTALL_DATA) config/mod_crowdsec.load config/mod_crowdsec.conf \
+	    $(DESTDIR)@APACHE_CONFROOT@/mods-available/
+endif
+if LAYOUT_EL
+	$(MKDIR_P) $(DESTDIR)@APACHE_CONFROOT@/conf.modules.d
+	$(INSTALL_DATA) config/10-crowdsec.conf \
+	    $(DESTDIR)@APACHE_CONFROOT@/conf.modules.d/10-crowdsec.conf
+	$(MKDIR_P) $(DESTDIR)@APACHE_CONFROOT@/conf.d
+	$(INSTALL_DATA) config/crowdsec-include.conf \
+	    $(DESTDIR)@APACHE_CONFROOT@/conf.d/crowdsec.conf
+endif
+
+install-data-local: install-bouncer-data install-apache-snippets
+.PHONY: install-bouncer-data install-apache-snippets
 
 clean-local:
 	rm -f @srcdir@/vendor/yyjson/yyjson.lo \

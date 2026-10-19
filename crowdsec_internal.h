@@ -18,6 +18,7 @@
 #include "apr.h"
 #include "apr_errno.h"
 #include "apr_pools.h"
+#include "apr_time.h"
 
 /* Remediations, ordered by severity. The merge of a LAPI decision and an
  * AppSec verdict is max(), so the order here is the policy.

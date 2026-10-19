@@ -49,6 +49,10 @@ m4/ltsugar.m4
 m4/ltversion.m4
 m4/lt~obsolete.m4
 
+# make dist output
+/*.tar.gz
+/*.tar.bz2
+
 # Generated Makefile
 # (meta build system like autotools,
 # can automatically generate from config.status script
@@ -87,3 +91,9 @@ debian/crowdsec-apache2-bouncer/
 /test/unit/t_verdict
 /test/unit/t_http
 crowdsec_version.h
+# generated from the .in templates by configure; the module and apache paths
+# in them come from apxs
+/config/mod_crowdsec.load
+/config/mod_crowdsec.conf
+/config/10-crowdsec.conf
+/config/crowdsec-include.conf

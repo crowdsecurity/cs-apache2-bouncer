@@ -1,0 +1,4 @@
+# Installed into conf.d. Separate from the conf.modules.d snippet because
+# httpd reads conf.modules.d first, and the directives below need the module
+# to be loaded before they are parsed.
+Include @CROWDSEC_CONFDIR@/crowdsec-apache2-bouncer.conf

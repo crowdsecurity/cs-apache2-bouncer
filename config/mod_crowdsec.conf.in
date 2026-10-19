@@ -1,0 +1,11 @@
+# The module itself is loaded by mod_crowdsec.load, which a2enmod symlinks
+# alongside this file.
+
+# The shared cache holds decisions. It is required by CrowdsecMode stream and
+# strongly recommended in live mode, where it saves every child process making
+# its own API query for the same client.
+<IfModule !socache_shmcb_module>
+  LoadModule socache_shmcb_module @APXS_LIBEXECDIR@/mod_socache_shmcb.so
+</IfModule>
+
+Include @CROWDSEC_CONFDIR@/crowdsec-apache2-bouncer.conf

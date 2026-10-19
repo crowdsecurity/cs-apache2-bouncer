@@ -33,7 +33,7 @@ EXTRA_DIST = $(CROWDSEC_SRC) $(CROWDSEC_HDRS) \
              test/README.md test/lib/harness.sh test/lib/stub_endpoint.py \
              test/unit/t_util.c test/unit/t_verdict.c test/unit/t_http.c \
              test/unit/mod_scan_conformance.c \
-             mod_crowdsec.spec
+             scripts/version.sh
 
 @srcdir@/vendor/yyjson/yyjson.lo: @srcdir@/vendor/yyjson/yyjson.c \
                                   @srcdir@/vendor/yyjson/yyjson.h
@@ -56,6 +56,28 @@ clean-local:
 	rm -f @srcdir@/vendor/yyjson/yyjson.lo \
 	      @srcdir@/vendor/yyjson/yyjson.slo
 	rm -rf @srcdir@/vendor/yyjson/.libs
+
+# --- version ---------------------------------------------------------------
+# configure.ac is the source of truth. debian/changelog is the one copy that
+# is not derived from it - the release pipeline regenerates it with dch, so
+# this only catches local and CI builds, which is where it would be noticed.
+check-version:
+	@v=`$(srcdir)/scripts/version.sh`; \
+	if test -f $(srcdir)/debian/changelog && \
+	   command -v dpkg-parsechangelog >/dev/null 2>&1; then \
+	    d=`dpkg-parsechangelog -l$(srcdir)/debian/changelog -S Version \
+	       | sed 's/-[^-]*$$//'`; \
+	    if test "$$v" != "$$d"; then \
+	        echo "version mismatch: configure.ac $$v, debian/changelog $$d" >&2; \
+	        exit 1; \
+	    fi; \
+	    echo "version $$v, matching debian/changelog"; \
+	else \
+	    echo "version $$v (no debian/changelog to check against)"; \
+	fi
+.PHONY: check-version
+
+check-local: check-version
 
 # --- tests -----------------------------------------------------------------
 # Unit tests link apr directly and need no server.

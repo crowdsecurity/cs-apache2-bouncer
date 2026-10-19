@@ -60,7 +60,6 @@ Makefile
 *.lo
 *.o
 *.slo
-*.spec
 
 # Ignore Debian package-specific temporary files
 .debhelper/
@@ -77,6 +76,7 @@ debian/crowdsec-apache2-bouncer/
 
 # editor
 .vscode/
+*~
 
 # automake test driver output
 /test-suite.log

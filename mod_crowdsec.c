@@ -91,14 +91,6 @@
 
 static const char *const crowdsec_id = "crowdsec";
 
-/* Only used to report our own identity to LAPI; cscli bouncers list shows
- * this, and the old code sent Apache's server description instead, so every
- * Apache bouncer appeared as an unknown type.
- */
-#ifndef CROWDSEC_BOUNCER_VERSION
-#define CROWDSEC_BOUNCER_VERSION "1.0.0"
-#endif
-
 static apr_status_t cleanup_lock(void *data)
 {
     server_rec *s = data;

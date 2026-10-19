@@ -71,6 +71,12 @@ typedef struct
  */
 apr_status_t crowdsec_http_child_init(apr_pool_t *pchild);
 
+/* Whether this libcurl accepted a protocol allowlist, i.e. whether requests
+ * really are confined to http and https. Only meaningful once
+ * crowdsec_http_child_init has run.
+ */
+int crowdsec_http_proto_ok(void);
+
 /* A pool of nmax reusable handles on pchild. nmax should be the MPM's thread
  * count so acquire() can never block.
  */

@@ -22,6 +22,52 @@
 
 static int curl_global_ready;
 
+/* Which option this libcurl accepts for the protocol allowlist. The headers
+ * decide what can be compiled, but the library decides what works: built
+ * against 7.85+ headers and loaded against an older runtime, PROTOCOLS_STR is
+ * rejected and the allowlist would be lost without anyone noticing, because
+ * curl_easy_setopt failures are not fatal.
+ */
+static enum { PROTO_NONE, PROTO_STR, PROTO_BITMASK } curl_proto_mode;
+
+/* curl 8.x marks CURLOPT_PROTOCOLS deprecated and we build with -Werror. */
+#ifndef CURL_IGNORE_DEPRECATION
+#define CURL_IGNORE_DEPRECATION(statements) statements
+#endif
+
+static void probe_proto_mode(void)
+{
+    CURL *h;
+    CURLcode rc = CURLE_UNKNOWN_OPTION;
+
+    curl_proto_mode = PROTO_NONE;
+    h = curl_easy_init();
+    if (!h) {
+        return;
+    }
+
+#if LIBCURL_VERSION_NUM >= 0x075500   /* 7.85.0 */
+    rc = curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "http,https");
+#endif
+    if (rc == CURLE_OK) {
+        curl_proto_mode = PROTO_STR;
+    }
+    else {
+        CURL_IGNORE_DEPRECATION(
+            rc = curl_easy_setopt(h, CURLOPT_PROTOCOLS,
+                                  (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));)
+        if (rc == CURLE_OK) {
+            curl_proto_mode = PROTO_BITMASK;
+        }
+    }
+    curl_easy_cleanup(h);
+}
+
+int crowdsec_http_proto_ok(void)
+{
+    return curl_proto_mode != PROTO_NONE;
+}
+
 static apr_status_t http_global_cleanup(void *data)
 {
     (void) data;
@@ -46,6 +92,11 @@ apr_status_t crowdsec_http_child_init(apr_pool_t *pchild)
     curl_global_ready = 1;
     apr_pool_cleanup_register(pchild, NULL, http_global_cleanup,
                               apr_pool_cleanup_null);
+
+    /* Must follow curl_global_init, and once per child is enough: the answer
+     * depends only on the library we are linked against.
+     */
+    probe_proto_mode();
 
     return APR_SUCCESS;
 }
@@ -268,6 +319,25 @@ static long ms_of(apr_interval_time_t t)
     return ms > 0 ? ms : 1;
 }
 
+/* Confines us to http and https, so a mistyped CrowdsecURL cannot turn a
+ * decision lookup into a file:// or scp:// fetch.
+ */
+static void apply_proto_allowlist(CURL *h)
+{
+#if LIBCURL_VERSION_NUM >= 0x075500   /* 7.85.0 */
+    if (curl_proto_mode == PROTO_STR) {
+        curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "http,https");
+        return;
+    }
+#endif
+    if (curl_proto_mode == PROTO_BITMASK) {
+        CURL_IGNORE_DEPRECATION(
+            curl_easy_setopt(h, CURLOPT_PROTOCOLS,
+                             (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));)
+    }
+    /* PROTO_NONE: nothing this libcurl takes; child init logged it once. */
+}
+
 static void apply_hardening(CURL *h)
 {
     /* Without this, an http_proxy in the server's environment silently routes
@@ -294,12 +364,7 @@ static void apply_hardening(CURL *h)
     curl_easy_setopt(h, CURLOPT_HTTP_VERSION,
                      (long) CURL_HTTP_VERSION_1_1);
 
-#if LIBCURL_VERSION_NUM >= 0x075500   /* 7.85.0 */
-    curl_easy_setopt(h, CURLOPT_PROTOCOLS_STR, "http,https");
-#else
-    curl_easy_setopt(h, CURLOPT_PROTOCOLS,
-                     (long) (CURLPROTO_HTTP | CURLPROTO_HTTPS));
-#endif
+    apply_proto_allowlist(h);
 }
 
 crowdsec_http_err_t crowdsec_http_exchange(apr_reslist_t *handles,

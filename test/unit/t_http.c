@@ -30,6 +30,13 @@ static int selftest(apr_pool_t *p)
 {
     struct curl_slist *l = NULL;
 
+    /* The protocol allowlist is probed in child_init rather than selected by
+     * the headers, so this is what catches a libcurl that takes neither
+     * option - on which the allowlist would otherwise be lost silently.
+     */
+    CHECK(crowdsec_http_child_init(p) == APR_SUCCESS, "curl init");
+    CHECK(crowdsec_http_proto_ok(), "libcurl took a protocol allowlist");
+
     /* the injection cases this guard exists for */
     CHECK(!crowdsec_http_header_add(p, &l, "X\rY", "v"), "CR in name");
     CHECK(!crowdsec_http_header_add(p, &l, "X\nY", "v"), "LF in name");

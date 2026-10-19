@@ -701,6 +701,12 @@ static void crowdsec_child_init(apr_pool_t *pchild, server_rec *s)
                      "apply CrowdsecFallback to every request");
         return;
     }
+    if (!crowdsec_http_proto_ok()) {
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s,
+                     "crowdsec: this libcurl accepts neither protocol "
+                     "allowlist option, so requests are not confined to "
+                     "http and https");
+    }
 
     ap_mpm_query(AP_MPMQ_MAX_THREADS, &threads);
     if (threads < 1) {

@@ -131,6 +131,70 @@ jobs:
           ./t_util_san
           ./t_verdict_san
 
+  # Reads the sources instead of running them, which is the half the sanitizers
+  # cannot reach: those only see what the unit drivers execute, and six of the
+  # eight sources need a live httpd to drive at all.
+  static-analysis:
+    name: static analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends $DEPS clang cppcheck
+
+      # configure runs only to generate config.h and crowdsec_version.h, which
+      # every source includes; nothing here links. Without --enable-werror on
+      # purpose: it would fold -Werror into ANALYZE_WARN for the advisory steps
+      # below as well, and only the gcc step is meant to gate.
+      - name: configure and collect flags
+        run: |
+          autoreconf -fi
+          ./configure --with-apxs=/usr/bin/apxs2
+          make -s print-analyzer-vars >> "$GITHUB_ENV"
+          echo "ANALYZE_INC=-I. -I./vendor/yyjson -I$(apxs2 -q INCLUDEDIR) $(pkg-config --cflags apr-1 apr-util-1 libcurl)" >> "$GITHUB_ENV"
+
+      # One source at a time, our code only - apxs hands one flag set to every
+      # source, which is why the Makefile already compiles yyjson separately.
+      # gcc 13: 22.04 ships 11, whose analyzer is weaker and noisier, so a
+      # matrix would buy noise rather than coverage. This baseline is clean, so
+      # it gates.
+      - name: gcc -fanalyzer
+        run: |
+          for f in $ANALYZE_SRC; do
+            echo "::group::$f"
+            gcc -fanalyzer -fanalyzer-call-summaries $ANALYZE_WARN -Werror \
+                $ANALYZE_INC $ANALYZE_DEFS -c -o /dev/null "$f"
+            echo "::endgroup::"
+          done
+
+      # A second opinion on the same sources: the two engines disagree often
+      # enough that both earn their place. Advisory until this baseline has
+      # been triaged - adding -Werror is what makes it gate.
+      - name: clang --analyze
+        continue-on-error: true
+        run: |
+          for f in $ANALYZE_SRC; do
+            echo "::group::$f"
+            clang --analyze -Xanalyzer -analyzer-output=text \
+                  $ANALYZE_INC $ANALYZE_DEFS -o /dev/null "$f"
+            echo "::endgroup::"
+          done
+
+      # A pattern sweep rather than path exploration, so it catches the
+      # sloppiness the two path analyzers skip. Our own include dirs only:
+      # pkg-config emits flags like -pthread that cppcheck rejects, and
+      # missingIncludeSystem covers what it then cannot find. Add
+      # --error-exitcode=1 to gate.
+      - name: cppcheck
+        continue-on-error: true
+        run: |
+          cppcheck --std=c11 --enable=warning,performance,portability \
+                   --inline-suppr --suppress=missingIncludeSystem --quiet \
+                   -I . -I vendor/yyjson $ANALYZE_DEFS $ANALYZE_SRC
+
   package:
     name: dpkg-buildpackage
     runs-on: ubuntu-24.04

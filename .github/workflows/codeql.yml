@@ -1,0 +1,65 @@
+---
+name: CodeQL
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  # The query suites are maintained upstream, so a periodic rerun finds things
+  # that no change of ours introduced.
+  schedule:
+    - cron: "27 4 * * 1"
+
+permissions:
+  contents: read
+
+env:
+  # Narrower than the test workflow's: this only builds the module, so it needs
+  # the headers and apxs but none of the MPMs or the functional harness.
+  DEPS: >-
+    apache2-dev
+    libapr1-dev libaprutil1-dev libcurl4-openssl-dev
+    autoconf automake libtool pkg-config
+
+jobs:
+  analyze:
+    name: analyze (c-cpp)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # Writing the results to the Security tab is the whole point, and it is
+      # why this is a separate workflow: ci.yml stays on contents:read.
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends $DEPS
+
+      # Has to come before the build: it installs the tracer that extracts the
+      # database as the sources compile.
+      - name: initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+          queries: security-extended
+
+      # No --enable-werror: a warning surfaced by the tracer's own flags would
+      # fail the build, which reads as a failed analysis rather than a finding.
+      - name: build
+        run: |
+          autoreconf -fi
+          ./configure --with-apxs=/usr/bin/apxs2
+          make
+
+      - name: analyse
+        uses: github/codeql-action/analyze@v3

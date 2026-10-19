@@ -111,3 +111,15 @@ test_unit_t_verdict_LDADD = $(apr_LIBS)
 test_unit_t_http_SOURCES = test/unit/t_http.c crowdsec_http.c crowdsec_util.c
 test_unit_t_http_CPPFLAGS = $(AM_CPPFLAGS) $(curl_CFLAGS)
 test_unit_t_http_LDADD = $(apr_LIBS) $(apu_LIBS) $(curl_LIBS)
+
+# --- CI helper -------------------------------------------------------------
+# The static-analysis job analyses each source on its own rather than through
+# apxs, so it needs the warning flags, the source list and the yyjson defines -
+# all already spelled out once above or in configure.ac. Emitted as KEY=value
+# so the job can append it straight to $$GITHUB_ENV, rather than keeping a
+# second copy of each that silently drifts.
+print-analyzer-vars:
+	@echo 'ANALYZE_WARN=$(CROWDSEC_WARN_CFLAGS)'
+	@echo 'ANALYZE_SRC=$(CROWDSEC_SRC)'
+	@echo 'ANALYZE_DEFS=$(YYJSON_DEFS)'
+.PHONY: print-analyzer-vars

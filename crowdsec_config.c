@@ -389,6 +389,15 @@ static const char *set_crowdsec_cache(cmd_parms *cmd, void *dconf,
         ap_get_module_config(cmd->server->module_config, &crowdsec_module);
     const char *errmsg, *name, *args = ap_strchr_c(arg, ':');
 
+    /* Only the server_rec that declares the cache initialises and destroys it,
+     * and the merge gives vhosts the pointer without that duty - so a
+     * vhost-scope cache would never be initialised at all.
+     */
+    errmsg = ap_check_cmd_context(cmd, NOT_IN_VIRTUALHOST);
+    if (errmsg) {
+        return errmsg;
+    }
+
     if (args) {
         name = apr_pstrmemdup(cmd->temp_pool, arg, args - arg);
         args++;

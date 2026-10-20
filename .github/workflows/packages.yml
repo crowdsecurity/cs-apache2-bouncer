@@ -23,6 +23,14 @@ on:
         description: upload the packages as workflow artifacts
         type: boolean
         default: false
+      version:
+        description: >-
+          package version to stamp, e.g. 1.0.0~rc1. Empty means take it from
+          configure.ac, which is what a push build wants. Release builds pass
+          the tag so that a prerelease produces a package apt and dnf can
+          actually tell apart from the final one.
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -105,7 +113,9 @@ jobs:
         run: |
           mkdir -p out
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" \
-            -e DEBIAN_FRONTEND=noninteractive "${{ matrix.target.image }}" sh -ec '
+            -e DEBIAN_FRONTEND=noninteractive \
+            -e PKG_VERSION="${{ inputs.version }}" \
+            "${{ matrix.target.image }}" sh -ec '
               # bullseye is EOL and its security suite has moved, so the stock
               # image ships apt lists that 404 on every fetch.
               if grep -q bullseye /etc/os-release; then
@@ -123,6 +133,14 @@ jobs:
               # Out of the read-only mount, and in its own parent so the built
               # .deb cannot be confused with anything else.
               mkdir -p /build && cp -a /src /build/pkg && cd /build/pkg
+              # Same mechanism as the release pipeline, which regenerates the
+              # changelog with dch rather than trusting the committed one.
+              if [ -n "${PKG_VERSION:-}" ]; then
+                rm -f debian/changelog
+                NAME="Crowdsec Team" DEBEMAIL=debian@crowdsec.net \
+                  dch --package crowdsec-apache2-bouncer -v "$PKG_VERSION" \
+                      --create "release $PKG_VERSION"
+              fi
               dpkg-buildpackage -us -uc -b
               deb=$(ls /build/crowdsec-apache2-bouncer_*.deb | grep -v dbgsym)
               # The mode on the config is the regression nothing else catches.
@@ -175,6 +193,7 @@ jobs:
         run: |
           mkdir -p out
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" \
+            -e PKG_VERSION="${{ inputs.version }}" \
             "${{ matrix.target.image }}" sh -ec '
               dnf -y -q install rpm-build rpmdevtools redhat-rpm-config \
                 gcc make autoconf automake libtool pkgconf-pkg-config \
@@ -185,9 +204,17 @@ jobs:
               # conflicts with, so asking for it fails there outright.
               command -v curl >/dev/null || dnf -y -q install curl
               cp -a /src /build && cd /build
-              export VERSION=$(scripts/version.sh)
-              export PACKAGE_NUMBER=1
+              # The same split build_rpms/matrix.yml does: a trailing
+              # -N is the rpm Release, anything else is the Version. A
+              # prerelease version is 1.0.0~rc1, which has no -, so it stays
+              # whole and rpm sorts it below 1.0.0 as intended.
+              v="${PKG_VERSION:-$(scripts/version.sh)}"
+              case "$v" in
+                *-*) export VERSION="${v%%-*}"; export PACKAGE_NUMBER="${v#*-}";;
+                *)   export VERSION="$v"; export PACKAGE_NUMBER=1;;
+              esac
               export RELEASEVER=el$(rpm -E %rhel)
+              echo "building version $VERSION release $PACKAGE_NUMBER"
               rpmdev-setuptree
               # The same shape the release pipeline uses: the source tarball is
               # the checkout, not a make dist.

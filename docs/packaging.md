@@ -79,13 +79,53 @@ Three traps when writing tests like this by hand:
 
 ## Releasing
 
+### Prereleases, for testing packages
+
+Tag `vX.Y.Z-rcN`. The package version becomes `X.Y.Z~rcN`, and the GitHub
+release is marked as a prerelease.
+
+The `-rc` → `~rc` rewrite is not cosmetic and it is not optional:
+
+- git refuses a `~` in a ref name, so the **tag** has to use `-rc`;
+- dpkg and rpm both sort `~` below nothing, so the **package version** has to
+  use `~rc` or the prerelease outranks the release it precedes. Measured:
+  `dpkg --compare-versions 1.0.0-rc1 lt 1.0.0-1` is **false**, while
+  `1.0.0~rc1 lt 1.0.0` is true.
+
+This is the same rewrite `codepipeline/fetch_sources/placeholder/buildspec.yml`
+performs, so a package built here is versioned identically to one the pipeline
+would build from the same tag.
+
+Verified on bookworm and EL9, installing each in turn:
+
+```
+1.0.0~rc1  ->  1.0.0~rc2  ->  1.0.0
+```
+
+apt and dnf both treat those as successive upgrades, which is the whole point:
+you can hand a tester rc1, then rc2, and they upgrade rather than having to
+purge in between.
+
+One thing that does **not** change: the version the module reports to the
+local API, which comes from `configure.ac` and so stays `1.0.0` for every rc
+of 1.0.0. `cscli bouncers list` will show `crowdsec-apache2-bouncer/1.0.0` for
+an rc build. The release pipeline behaves the same way — it never touches
+`configure.ac` — so this is consistent rather than a quirk of CI, but it does
+mean the engine cannot distinguish rc1 from the final release.
+
+`make check-version` compares only the upstream part of the changelog version,
+stripping a trailing `-revision` and any `~suffix`. It has to: `dh_auto_test`
+runs `make check` *after* `dch` has stamped the tag into the changelog, so a
+gate comparing the full string fails every prerelease build.
+
+### Steps
+
 1. Bump the version in `configure.ac` and `debian/changelog`; `make
-   check-version` asserts they agree.
-2. Tag `vX.Y.Z`, or `vX.Y.Z~rcN` for a prerelease per the house
-   tilde-versioning rule.
-3. `.github/workflows/release.yml` checks the tag against `configure.ac`,
-   builds every target for both architectures, and attaches the packages to a
-   GitHub release. A `~rc` tag is published as a prerelease.
+   check-version` asserts the upstream parts agree.
+2. Tag `vX.Y.Z`, or `vX.Y.Z-rcN` for a prerelease.
+3. `.github/workflows/release.yml` derives the package version from the tag,
+   checks its upstream part against `configure.ac`, builds every target for
+   both architectures, and attaches the packages to a GitHub release.
 ### What a release contains
 
 One asset per target and architecture. The deb filenames carry the codename

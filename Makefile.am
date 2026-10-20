@@ -109,16 +109,19 @@ clean-local:
 
 # --- version ---------------------------------------------------------------
 # configure.ac is the source of truth. debian/changelog is the one copy that
-# is not derived from it - the release pipeline regenerates it with dch, so
-# this only catches local and CI builds, which is where it would be noticed.
+# is not derived from it - the release build regenerates it with dch to stamp
+# the tag - so compare only the upstream part: strip a trailing -revision and
+# any ~suffix, which is what a prerelease version like 1.0.0~rc1 carries.
+# Without that this target fails every release build, since dh_auto_test runs
+# it after dch has already put the tag in the changelog.
 check-version:
 	@v=`$(srcdir)/scripts/version.sh`; \
 	if test -f $(srcdir)/debian/changelog && \
 	   command -v dpkg-parsechangelog >/dev/null 2>&1; then \
 	    d=`dpkg-parsechangelog -l$(srcdir)/debian/changelog -S Version \
-	       | sed 's/-[^-]*$$//'`; \
+	       | sed 's/-[^-]*$$//; s/~.*$$//'`; \
 	    if test "$$v" != "$$d"; then \
-	        echo "version mismatch: configure.ac $$v, debian/changelog $$d" >&2; \
+	        echo "upstream version mismatch: configure.ac $$v, debian/changelog $$d" >&2; \
 	        exit 1; \
 	    fi; \
 	    echo "version $$v, matching debian/changelog"; \

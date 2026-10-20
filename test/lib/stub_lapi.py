@@ -24,7 +24,16 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+try:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+except ImportError:
+    # ThreadingHTTPServer landed in python 3.7; EL8 ships 3.6, and it is the
+    # same two ingredients the stdlib combines.
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from socketserver import ThreadingMixIn
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 from urllib.parse import urlparse, parse_qs
 
 port = int(sys.argv[1])

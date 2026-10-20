@@ -22,7 +22,7 @@ env:
   DEPS: >-
     apache2 apache2-dev apache2-utils
     libapr1-dev libaprutil1-dev libcurl4-openssl-dev
-    autoconf automake libtool pkg-config bats
+    autoconf automake libtool pkg-config bats gettext-base
 
 jobs:
   # 22.04 is not redundant: libcurl there is 7.81, which takes the
@@ -195,24 +195,9 @@ jobs:
                    --inline-suppr --suppress=missingIncludeSystem --quiet \
                    -I . -I vendor/yyjson $ANALYZE_DEFS $ANALYZE_SRC
 
-  package:
-    name: dpkg-buildpackage
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: install dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends \
-            build-essential debhelper devscripts dpkg-dev $DEPS
-
-      # The only job that notices a missing Build-Depends. It will not catch
-      # distros that ship uutils coreutils instead of GNU: both runners are
-      # GNU, and that difference broke postinst on Ubuntu 26.04 - see
-      # scripts/_bouncer.sh.
-      - name: build the package
-        run: dpkg-buildpackage -us -uc -b
-
-      - name: show what was produced
-        run: dpkg -c ../crowdsec-apache2-bouncer_*.deb
+  # Per-target build and install test. The old job here built one deb on the
+  # runner and only listed its contents, so nothing checked that the package
+  # installs, that the maintainer scripts work, or that the config lands 0600.
+  packages:
+    name: packages
+    uses: ./.github/workflows/packages.yml

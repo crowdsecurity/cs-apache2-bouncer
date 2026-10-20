@@ -41,7 +41,9 @@ EXTRA_DIST = $(CROWDSEC_SRC) $(CROWDSEC_HDRS) \
              test/bats/http-client.bats test/bats/limits.bats \
              test/bats/live-mode.bats test/bats/scan-conformance.bats \
              test/bats/stream-mode.bats \
-             fuzz/README.md \
+             fuzz/README.md test/pkg/smoke.sh \
+             rpm/SPECS/crowdsec-apache2-bouncer.spec \
+             docs/packaging.md \
              scripts/version.sh scripts/_bouncer.sh \
              config/crowdsec-apache2-bouncer.conf \
              config/crowdsec.load.in config/crowdsec.conf.in \

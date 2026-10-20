@@ -1,0 +1,79 @@
+---
+# Tagged releases. Builds every target for both architectures, attaches the
+# packages to a GitHub release, and stops there: publishing to packagecloud is
+# done by the AWS CodePipeline in crowdsecurity/packaging, which is triggered
+# by the GitHub release itself. See docs/packaging.md.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # The tag is what the packaging pipeline hands the build as $VERSION, so a
+  # tag that disagrees with configure.ac would produce packages whose version
+  # does not match the source.
+  version:
+    name: tag matches configure.ac
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          tag="${GITHUB_REF_NAME#v}"
+          src=$(scripts/version.sh)
+          # A prerelease is tagged v1.0.0~rc1 per the house tilde-versioning
+          # rule, and configure.ac carries the plain version.
+          base="${tag%%\~*}"
+          if [ "$base" != "$src" ]; then
+            echo "tag $GITHUB_REF_NAME implies version $base, but configure.ac says $src" >&2
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches configure.ac $src"
+
+  packages:
+    name: packages
+    needs: version
+    uses: ./.github/workflows/packages.yml
+    with:
+      arches: '["amd64","arm64"]'
+      upload: true
+
+  release:
+    name: github release
+    needs: packages
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - run: |
+          ls -l artifacts
+          test -n "$(ls artifacts/*.deb 2>/dev/null)" || { echo "no debs" >&2; exit 1; }
+          test -n "$(ls artifacts/*.rpm 2>/dev/null)" || { echo "no rpms" >&2; exit 1; }
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          # Publishing a prerelease is what routes the packaging pipeline to
+          # the -testing repositories rather than production.
+          prerelease: ${{ contains(github.ref_name, '~rc') }}
+          generate_release_notes: true
+
+      # TODO: nothing here pushes to packagecloud, and it should stay that way.
+      # The release above fires the webhook that starts the CodePipeline in
+      # crowdsecurity/packaging, which signs and pushes to
+      # crowdsec/crowdsec-apache{,-testing}. That pipeline still needs changes
+      # before it can ship the rpms at all - disable_rpm is true for this
+      # product, update_rpm has no APACHE_BOUNCER branch, and the deb publish
+      # step fans out one bookworm build to every distro. See docs/packaging.md.
+      - name: publishing is handled outside this repo
+        run: |
+          echo "Packages are attached to the GitHub release."
+          echo "packagecloud publishing happens in crowdsecurity/packaging;"
+          echo "see docs/packaging.md for the changes that lane still needs."

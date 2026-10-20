@@ -25,7 +25,16 @@ import json
 import os
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+try:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+except ImportError:
+    # ThreadingHTTPServer landed in python 3.7; EL8 ships 3.6, and it is the
+    # same two ingredients the stdlib combines.
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from socketserver import ThreadingMixIn
+
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 port = int(sys.argv[1])
 state_path = sys.argv[2]

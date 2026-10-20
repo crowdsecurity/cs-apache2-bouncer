@@ -17,6 +17,7 @@
 #include "apr_thread_proc.h"
 
 #include "crowdsec_http.h"
+#include "crowdsec_metrics.h"
 #include "crowdsec_util.h"
 
 /* must be last: see the file for why */
@@ -308,6 +309,15 @@ static void *APR_THREAD_FUNC poller_main(apr_thread_t *thd, void *data)
          * rate, so the pull itself is gated on elapsed time.
          */
         if (leader && apr_time_now() - last_pull >= sconf->update_frequency) {
+            /* The reporting thread asks for a full pull once per window,
+             * because that is the only kind that can rebuild the
+             * active_decisions gauge - see crowdsec_store_apply_stream. Taken
+             * here rather than when it is set, so the request is only consumed
+             * by a pull that is actually about to happen.
+             */
+            if (crowdsec_metrics_resync_take(sconf)) {
+                need_full = 1;
+            }
             apr_pool_create(&ptemp, tpool);
             if (do_pull(s, sconf, need_full, ptemp) == APR_SUCCESS) {
                 need_full = 0;

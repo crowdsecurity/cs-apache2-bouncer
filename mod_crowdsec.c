@@ -84,6 +84,7 @@
 #include "crowdsec_appsec.h"
 #include "crowdsec_http.h"
 #include "crowdsec_lapi.h"
+#include "crowdsec_metrics.h"
 #include "crowdsec_util.h"
 
 /* must be last: see the file for why */
@@ -139,6 +140,16 @@ const char *crowdsec_client_ip(request_rec *r, crowdsec_config_rec *conf)
         return r->connection->client_ip;
     }
     return r->useragent_ip;
+}
+
+/* Which family label this client address gets. A v6 literal always carries a
+ * colon and a v4 one never does, which is the same split crowdsec_cidr_parse
+ * makes - so the metric label agrees with how the store keyed the address,
+ * including for the v4-mapped form some proxies produce.
+ */
+static int client_ipt(const char *ip)
+{
+    return ap_strchr_c(ip, ':') ? CROWDSEC_IPT_V6 : CROWDSEC_IPT_V4;
 }
 
 /* ------------------------------------------------------------ the decision */
@@ -273,9 +284,11 @@ static int crowdsec_check_access(request_rec *r)
                                                       &crowdsec_module);
     crowdsec_req_rec *st;
     crowdsec_rem_t rem = CROWDSEC_REM_ALLOW;
+    crowdsec_rem_t lapi_rem = CROWDSEC_REM_ALLOW;
     crowdsec_lookup_t lr;
     const char *ip;
-    int appsec_on, challenge_path = 0;
+    unsigned char origin = CROWDSEC_ORIGIN_UNKNOWN;
+    int appsec_on, challenge_path = 0, ipt;
 
     /* A subrequest is covered by the main request. */
     if (r->main) {
@@ -359,6 +372,14 @@ static int crowdsec_check_access(request_rec *r)
     if (!ip) {
         return crowdsec_fallback(r, conf, "no client address");
     }
+    ipt = client_ipt(ip);
+
+    /* Counted here, where the request is certainly being decided, and counted
+     * once: subrequests and internal redirects that inherit a verdict have
+     * already returned above, and a scope with nothing enabled never gets
+     * this far.
+     */
+    crowdsec_metrics_processed(sconf, ipt);
 
     st = apr_pcalloc(r->pool, sizeof(*st));
     st->r = r;
@@ -366,7 +387,8 @@ static int crowdsec_check_access(request_rec *r)
 
     /* 1. The local API's view, from the stream cache or a live query. */
     if (conf->enable && sconf->url) {
-        lr = crowdsec_lapi_lookup(r, sconf, ip, &rem);
+        lr = crowdsec_lapi_lookup(r, sconf, ip, &rem, &origin);
+        lapi_rem = rem;
         if (lr != CROWDSEC_LOOKUP_OK) {
             int fb = crowdsec_fallback(r, conf,
                                        lr == CROWDSEC_LOOKUP_UNPRIMED
@@ -432,6 +454,15 @@ static int crowdsec_check_access(request_rec *r)
         }
     }
 
+    /* Whatever the inspection added is the WAF's call, not a decision's, so it
+     * is reported under its own origin - the same split the haproxy bouncer
+     * makes. Without this the WAF looks idle in the Console however much it is
+     * blocking.
+     */
+    if (rem > lapi_rem) {
+        origin = CROWDSEC_ORIGIN_APPSEC;
+    }
+
     if (rem == CROWDSEC_REM_UNKNOWN || rem == CROWDSEC_REM_CAPTCHA) {
         if (rem == CROWDSEC_REM_CAPTCHA) {
             ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
@@ -459,6 +490,10 @@ static int crowdsec_check_access(request_rec *r)
         rv = crowdsec_appsec_serve(r, &st->verdict);
         if (rv == DONE) {
             apr_table_setn(r->subprocess_env, "CROWDSEC_STATUS", "challenge");
+            /* An interstitial is a block as far as the metric is concerned:
+             * the request did not reach the origin.
+             */
+            crowdsec_metrics_dropped(sconf, ipt, origin);
             return DONE;
         }
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
@@ -468,6 +503,12 @@ static int crowdsec_check_access(request_rec *r)
     }
 
     if (rem >= CROWDSEC_REM_BAN) {
+        /* Counted here rather than inside crowdsec_apply, which the fallback
+         * path also reaches: a request blocked because the local API was
+         * unreachable has no decision behind it and so no origin to attribute
+         * it to. It is still counted as processed.
+         */
+        crowdsec_metrics_dropped(sconf, ipt, origin);
         return crowdsec_apply(r, conf, rem, ip);
     }
 
@@ -511,6 +552,8 @@ static int crowdsec_status_handler(request_rec *r)
     ap_rprintf(r, "url: %s\n", sconf->url ? sconf->url : "(unset)");
     ap_rprintf(r, "cache: %s\n", sconf->cache_instance ? "yes" : "no");
 
+    crowdsec_metrics_status(r, sconf);
+
     if (sconf->mode == CROWDSEC_MODE_STREAM
         && crowdsec_store_stats(r->server, sconf, &st)) {
         ap_rprintf(r, "primed: %s\n", st.primed_at ? "yes" : "no");
@@ -539,6 +582,15 @@ static int crowdsec_pre_config(apr_pool_t *pconf, apr_pool_t *plog,
         ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, plog,
                       "failed to register %s mutex", crowdsec_id);
         return 500;             /* An HTTP status would be a misnomer! */
+    }
+    /* The metrics counters have a lock of their own: they are reached in live
+     * mode too, where there may be no decision cache and so no cache mutex.
+     */
+    rv = crowdsec_metrics_pre_config(pconf);
+    if (rv != APR_SUCCESS) {
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, plog,
+                      "failed to register the %s metrics mutex", crowdsec_id);
+        return 500;
     }
     return OK;
 }
@@ -628,6 +680,13 @@ static int crowdsec_post_config(apr_pool_t *pconf, apr_pool_t *plog,
             return 500;
         }
 
+        if (crowdsec_metrics_create(pconf, plog, s, s_vhost) != APR_SUCCESS) {
+            ap_log_perror(APLOG_MARK, APLOG_CRIT, 0, plog,
+                          "failed to create the %s metrics region",
+                          crowdsec_id);
+            return 500;
+        }
+
         if (remoteip_loaded) {
             /* mod_remoteip's trusted-proxy list is private to it, so a notice
              * is all we can offer: with RemoteIPHeader set and no trusted
@@ -704,6 +763,12 @@ static void crowdsec_child_init(apr_pool_t *pchild, server_rec *s)
     if (threads < 1) {
         threads = 1;
     }
+    /* Plus two for the background threads - the stream poller and the metrics
+     * reporter - which borrow from the same pool. Sized so that acquiring a
+     * handle can never block, because a blocked request is a request whose
+     * latency we have handed to whatever the other thread is waiting on.
+     */
+    threads += 2;
 
     /* One pool for the whole child, not one per vhost. The handles carry no
      * per-vhost state - every option is set per exchange - so a pool each
@@ -739,6 +804,7 @@ static void crowdsec_child_init(apr_pool_t *pchild, server_rec *s)
     }
 
     crowdsec_poller_start(pchild, s);
+    crowdsec_metrics_start(pchild, s);
 }
 
 static void register_hooks(apr_pool_t *p)

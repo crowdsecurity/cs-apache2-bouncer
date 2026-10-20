@@ -90,6 +90,7 @@ debian/crowdsec-apache2-bouncer/
 /test/unit/t_util
 /test/unit/t_verdict
 /test/unit/t_http
+/test/unit/t_metrics
 crowdsec_version.h
 # generated from the .in templates by configure; the module and apache paths
 # in them come from apxs

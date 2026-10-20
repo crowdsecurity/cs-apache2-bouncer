@@ -18,6 +18,8 @@ See also the [public documentation](https://doc.crowdsec.net/u/bouncers/apache_b
   the AppSec/WAF component inline; the verdict decides the request.
 - **Bot detection** — serves the challenge interstitial, its assets and its
   submit endpoint, and relays the resulting cookie.
+- **Usage metrics** — request and decision counts reported to the local API,
+  so the bouncer appears in `cscli metrics show bouncers` and the Console.
 - IPv4 and IPv6, single addresses and ranges.
 - Unix socket or TCP for AppSec.
 
@@ -149,14 +151,33 @@ real TCP peer instead.
 </Location>
 ```
 
-Reports `mode`, `url`, `cache`, and in stream mode `primed`, `pulls`,
-`stored`, `retained` and `last_pull_age_ms`.
+Reports `mode`, `url`, `cache`, the usage-metrics counters, and in stream mode
+`primed`, `pulls`, `stored`, `retained` and `last_pull_age_ms`.
 
 `stored` is what the last full pull wrote. `retained` estimates how many
 survived, extrapolated from a sample of up to 32 keys re-read after the pull,
 so treat it as an indicator rather than a count. `retained` below `stored`
 means the cache is evicting decisions and needs to be larger; the error log
 says so too.
+
+The metrics block reports `metrics` (`on`/`off`), the reporting interval, the
+age of the current window and of the last push, the push and failure counts,
+the last HTTP status, how many origins have been seen, and then one line per
+counter in the shape the payload uses:
+
+```
+metrics_last_status: 201
+processed{ip_type=ipv4}: 412
+dropped{ip_type=ipv4,origin=CAPI}: 17
+dropped{ip_type=ipv4,origin=appsec}: 3
+active_decisions{ip_type=ipv4,origin=lists:firehol_level1}: 11830
+```
+
+The counters are what has accumulated since the last accepted push, not totals
+for the life of the server: a successful push takes back exactly what it
+reported. `metrics_last_status` other than `201` with a growing
+`metrics_window_age_s` means pushes are being rejected and nothing is being
+lost - the next accepted one carries the whole period.
 
 ## Logging
 
@@ -208,6 +229,19 @@ Scope column: **S** = server/vhost only, **S+D** = also valid in
 | `CrowdsecRemediationFallback` | S+D | `ban` | What an AppSec remediation this module cannot serve (captcha, or a custom one) becomes: `ban` or `allow`. Does not apply to local API decisions. |
 | `CrowdsecTrustUseragentIP` | S+D | `On` | Trust the address reported by modules such as `mod_remoteip`. `Off` uses the connection's real peer. |
 
+### Metrics
+
+| Directive | Scope | Default | Description |
+|---|---|---|---|
+| `CrowdsecMetrics` | S | `On` | Report usage metrics to `CrowdsecURL`'s `/v1/usage-metrics`. Off disables the counters as well, not just the reporting. |
+| `CrowdsecMetricsInterval` | S | `15m` | How often to report. Matches the other bouncers. Floored at `10s`; anything under a minute is for testing and is warned about in the error log. |
+
+Servers sharing a `CrowdsecURL` and `CrowdsecAPIKey` are one component as far
+as the local API is concerned, so they share one set of counters and one
+reporter. An AppSec-only vhost - `CrowdsecAppsecURL` with no `CrowdsecURL` -
+reports nothing, because `/v1/usage-metrics` is a local API endpoint and the
+AppSec datasource has none; the error log says so at startup.
+
 ### AppSec
 
 | Directive | Scope | Default | Description |
@@ -236,6 +270,19 @@ specific reason.
 
 **No captcha.** An AppSec `captcha` remediation is resolved through
 `CrowdsecRemediationFallback`, which defaults to `ban`.
+
+**`active_decisions` is reported in stream mode only.** Live mode keeps no
+local decision store, so there is nothing to count; reporting zero would be a
+claim the bouncer cannot make. Same as the nginx bouncer.
+
+**`processed` counts one per request.** The haproxy bouncer counts one per
+connection when its TCP stage runs, so a keep-alive connection serving many
+requests registers as one there and as many here. Comparing the two bouncers'
+request volumes directly will mislead.
+
+**A request blocked by `CrowdsecFallback block` is not counted as `dropped`.**
+There is no decision behind it, so there is no origin to attribute it to.
+It is still counted as `processed`.
 
 **Stream decisions are enforced as a ban.** The decision stream carries no
 interstitial, so a `challenge` or `captcha` decision from the local API becomes

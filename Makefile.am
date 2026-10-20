@@ -11,10 +11,12 @@ YYJSON_DEFS = -DYYJSON_READER_DEPTH_LIMIT=8 \
 CROWDSEC_HDRS = crowdsec_internal.h crowdsec_config.h crowdsec_util.h \
                 crowdsec_http.h crowdsec_lapi.h crowdsec_store.h crowdsec_verdict.h \
                 crowdsec_appsec.h \
+                crowdsec_metrics.h crowdsec_metrics_json.h \
                 crowdsec_poison.h
 
 CROWDSEC_SRC = mod_crowdsec.c crowdsec_config.c crowdsec_util.c crowdsec_http.c \
-               crowdsec_lapi.c crowdsec_poller.c crowdsec_verdict.c crowdsec_appsec.c
+               crowdsec_lapi.c crowdsec_poller.c crowdsec_verdict.c crowdsec_appsec.c \
+               crowdsec_metrics.c crowdsec_metrics_json.c
 
 CROWDSEC_INC = -I@srcdir@ -I@srcdir@/vendor/yyjson
 
@@ -34,12 +36,14 @@ EXTRA_DIST = $(CROWDSEC_SRC) $(CROWDSEC_HDRS) \
              test/lib/stub_endpoint.py test/lib/stub_lapi.py \
              test/lib/stub_appsec.py test/lib/memo_probe.py \
              test/unit/t_util.c test/unit/t_verdict.c test/unit/t_http.c \
+             test/unit/t_metrics.c \
              test/unit/mod_scan_conformance.c \
              test/bats/appsec.bats test/bats/appsec-body.bats \
              test/bats/blocked-http-code.bats test/bats/challenge.bats \
              test/bats/connect.bats test/bats/gating.bats \
              test/bats/http-client.bats test/bats/limits.bats \
-             test/bats/live-mode.bats test/bats/scan-conformance.bats \
+             test/bats/live-mode.bats test/bats/metrics.bats \
+             test/bats/scan-conformance.bats \
              test/bats/stream-mode.bats \
              fuzz/README.md test/pkg/smoke.sh \
              rpm/SPECS/crowdsec-apache2-bouncer.spec \
@@ -170,7 +174,8 @@ fuzz:
 endif
 .PHONY: fuzz
 
-check_PROGRAMS = test/unit/t_util test/unit/t_verdict test/unit/t_http
+check_PROGRAMS = test/unit/t_util test/unit/t_verdict test/unit/t_http \
+                 test/unit/t_metrics
 TESTS = $(check_PROGRAMS)
 
 AM_CPPFLAGS = $(CROWDSEC_INC) $(apr_CFLAGS) $(apu_CFLAGS)
@@ -186,6 +191,11 @@ test_unit_t_verdict_LDADD = $(apr_LIBS)
 test_unit_t_http_SOURCES = test/unit/t_http.c crowdsec_http.c crowdsec_util.c
 test_unit_t_http_CPPFLAGS = $(AM_CPPFLAGS) $(curl_CFLAGS)
 test_unit_t_http_LDADD = $(apr_LIBS) $(apu_LIBS) $(curl_LIBS)
+
+# The payload builder is apr-only for exactly this reason: the document's shape
+# can be asserted without a running server.
+test_unit_t_metrics_SOURCES = test/unit/t_metrics.c crowdsec_metrics_json.c
+test_unit_t_metrics_LDADD = $(apr_LIBS)
 
 # --- CI helper -------------------------------------------------------------
 # The static-analysis job analyses each source on its own rather than through

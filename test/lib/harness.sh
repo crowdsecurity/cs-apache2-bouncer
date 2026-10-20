@@ -131,10 +131,166 @@ lapi_get() {
         "$LAPI_STATE" "$1"
 }
 
+# lapi_patch <key> <json value>   change one key, leaving the rest alone
+#
+# lapi_set replaces the whole file, which also discards the pushes the stub has
+# recorded - so a test that flips a knob mid-run has to merge instead.
+lapi_patch() {
+    python3 -c '
+import fcntl, json, os, sys
+state, key, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(state + ".lock", "w") as lk:
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    try:
+        with open(state) as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        d = {}
+    d[key] = json.loads(raw)
+    tmp = state + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(d, fh)
+    os.replace(tmp, state)' "$LAPI_STATE" "$1" "$2"
+}
+
+# --- usage metrics ------------------------------------------------------
+# How many pushes the stub has recorded, 0 rather than empty before the first.
+metrics_posts() {
+    python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        print(int(json.load(fh).get("metrics_posts", 0)))
+except (OSError, ValueError):
+    print(0)' "$LAPI_STATE"
+}
+
+# Waits until at least <n> metrics pushes have been recorded, so a test does
+# not race the reporting window.
+wait_metrics() {
+    local want="${1:-1}" i=0
+
+    while [ "$i" -lt 300 ]; do
+        if [ "$(metrics_posts)" -ge "$want" ]; then
+            return 0
+        fi
+        i=$((i + 1)); sleep 0.1
+    done
+    echo "only $(metrics_posts) metrics pushes, wanted $want" >&2
+    sed -n "s/^/  log: /p" "$HARNESS_DIR/logs/error.log" | tail -20 >&2
+    return 1
+}
+
+# metric_item <index> <name> [label=value ...]
+# The value of one item from a recorded payload, or "" if it is not there.
+# <index> is 0 for the first push, -1 for the most recent.
+metric_item() {
+    local idx="$1" name="$2"; shift 2
+    python3 -c '
+import json, sys
+state, idx, name = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+want = dict(a.split("=", 1) for a in sys.argv[4:])
+pushes = json.load(open(state)).get("metrics") or []
+if not pushes or idx >= len(pushes) or idx < -len(pushes):
+    print(""); raise SystemExit
+comp = (pushes[idx].get("remediation_components") or [{}])[0]
+for window in comp.get("metrics") or []:
+    for it in window.get("items") or []:
+        if it.get("name") != name:
+            continue
+        labels = it.get("labels") or {}
+        if all(labels.get(k) == v for k, v in want.items()):
+            print(it.get("value")); raise SystemExit
+print("")' "$LAPI_STATE" "$idx" "$name" "$@"
+}
+
+# metric_item_max <name> [label=value ...]
+# The largest value any recorded push reported for this item, or "" if none
+# did. For assertions where which push carried the number is a race.
+metric_item_max() {
+    local name="$1"; shift
+    python3 -c '
+import json, sys
+state, name = sys.argv[1], sys.argv[2]
+want = dict(a.split("=", 1) for a in sys.argv[3:])
+best = None
+for push in json.load(open(state)).get("metrics") or []:
+    for comp in push.get("remediation_components") or []:
+        for window in comp.get("metrics") or []:
+            for it in window.get("items") or []:
+                if it.get("name") != name:
+                    continue
+                labels = it.get("labels") or {}
+                if all(labels.get(k) == v for k, v in want.items()):
+                    v = it.get("value")
+                    if best is None or v > best:
+                        best = v
+print("" if best is None else best)' "$LAPI_STATE" "$name" "$@"
+}
+
+# metric_meta <index> <field>   e.g. window_size_seconds
+metric_meta() {
+    python3 -c '
+import json, sys
+state, idx, field = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+pushes = json.load(open(state)).get("metrics") or []
+if not pushes or idx >= len(pushes) or idx < -len(pushes):
+    print(""); raise SystemExit
+comp = (pushes[idx].get("remediation_components") or [{}])[0]
+w = (comp.get("metrics") or [{}])[0]
+print((w.get("meta") or {}).get(field, ""))' "$LAPI_STATE" "$1" "$2"
+}
+
+# metric_component <index> <field>  e.g. type, version, utc_startup_timestamp
+metric_component() {
+    python3 -c '
+import json, sys
+state, idx, field = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+pushes = json.load(open(state)).get("metrics") or []
+if not pushes or idx >= len(pushes) or idx < -len(pushes):
+    print(""); raise SystemExit
+comp = (pushes[idx].get("remediation_components") or [{}])[0]
+v = comp.get(field)
+print("" if v is None else json.dumps(v) if isinstance(v, (dict, list))
+      else v)' "$LAPI_STATE" "$1" "$2"
+}
+
+# metric_raw <index>   the payload exactly as it went out
+metric_raw() {
+    python3 -c '
+import json, sys
+raws = json.load(open(sys.argv[1])).get("metrics_raw") or []
+idx = int(sys.argv[2])
+print(raws[idx] if raws and -len(raws) <= idx < len(raws) else "")' \
+        "$LAPI_STATE" "$1"
+}
+
+metric_header() {
+    python3 -c '
+import json, sys
+h = json.load(open(sys.argv[1])).get("metrics_headers") or {}
+print(h.get(sys.argv[2].lower(), ""))' "$LAPI_STATE" "$1"
+}
+
+# One counter line out of CrowdsecStatus. Avoids status_field because the
+# labels carry braces, which sed would read as an interval expression.
+status_metric() {
+    curl -fsS --max-time 5 "http://127.0.0.1:$APACHE_PORT/crowdsec-status" \
+        | grep -F "$1: " | cut -d' ' -f2-
+}
+
 # A ban decision for one value, as the API would render it.
 decision() {
     printf '{"duration":"%s","id":1,"origin":"cscli","scenario":"manual","scope":"%s","type":"ban","value":"%s"}' \
         "${3:-1h0m0s}" "$2" "$1"
+}
+
+# decision_from <value> <scope> <origin> [scenario] [duration]
+# Like decision(), but with the origin the metrics attribute the block to. A
+# blocklist decision is origin "lists" plus the list name in scenario.
+decision_from() {
+    printf '{"duration":"%s","id":1,"origin":"%s","scenario":"%s","scope":"%s","type":"ban","value":"%s"}' \
+        "${5:-1h0m0s}" "$3" "${4:-manual}" "$2" "$1"
 }
 
 # Waits until the module reports the stream as loaded, so a test does not race

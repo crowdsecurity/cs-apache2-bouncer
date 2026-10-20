@@ -34,6 +34,7 @@ typedef struct
     unsigned char key[MAX_SEEN][CROWDSEC_KEY_MAX];
     apr_size_t keylen[MAX_SEEN];
     apr_interval_time_t dur[MAX_SEEN];
+    char origin[MAX_SEEN][CROWDSEC_ORIGIN_LEN];
     apr_status_t rv;            /* what to return, for the abort test */
 } collector_t;
 
@@ -47,6 +48,7 @@ static apr_status_t collect(void *ctx, int added,
         c->keylen[c->n] = crowdsec_key_encode(&d->net, c->key[c->n],
                                               CROWDSEC_KEY_MAX);
         c->dur[c->n] = d->duration;
+        apr_cpystrn(c->origin[c->n], d->origin, CROWDSEC_ORIGIN_LEN);
         c->n++;
     }
     return c->rv;
@@ -226,11 +228,12 @@ static void test_depth_limit(apr_pool_t *p)
     /* Valid JSON: an array nested 32 deep. Without the depth limit this parses
      * happily and reports a non-empty array, i.e. "banned".
      */
-    CHECK(!crowdsec_decisions_any(deep, strlen(deep), p, &any, &err),
+    CHECK(!crowdsec_decisions_probe(deep, strlen(deep), p, &any, NULL, 0,
+                                    &err),
           "nesting past the depth limit is refused");
 
     /* Shallow nesting still works, so the limit is not rejecting everything. */
-    CHECK(crowdsec_decisions_any("[[1]]", 5, p, &any, &err) && any,
+    CHECK(crowdsec_decisions_probe("[[1]]", 5, p, &any, NULL, 0, &err) && any,
           "nesting within the limit still parses");
 }
 
@@ -256,31 +259,175 @@ static void test_abort(apr_pool_t *p)
     CHECK(c.n == 1, "stopped at the first failure");
 }
 
-static void test_decisions_any(apr_pool_t *p)
+static void test_decisions_probe(apr_pool_t *p)
 {
+    char origin[CROWDSEC_ORIGIN_LEN];
     int any;
     const char *err;
 
-    CHECK(crowdsec_decisions_any("null", sizeof("null") - 1, p, &any, &err) && !any,
-          "null means none");
-    CHECK(crowdsec_decisions_any("[]", sizeof("[]") - 1, p, &any, &err) && !any,
-          "empty array means none");
-    {
-        static const char one[] = "[{\"value\":\"1.2.3.4\"}]";
+#define PROBE(j) crowdsec_decisions_probe((j), sizeof(j) - 1, p, &any, \
+                                          origin, sizeof(origin), &err)
 
-        CHECK(crowdsec_decisions_any(one, strlen(one), p, &any, &err) && any,
-              "non-empty means banned");
-    }
+    CHECK(PROBE("null") && !any, "null means none");
+    CHECK(PROBE("[]") && !any, "empty array means none");
+    CHECK(PROBE("[{\"value\":\"1.2.3.4\"}]") && any,
+          "non-empty means banned");
     /* The old code did strcmp(body, "null"), so these were indistinguishable
      * from a ban.
      */
-    CHECK(crowdsec_decisions_any("  null  ", sizeof("  null  ") - 1, p, &any, &err) && !any,
+    CHECK(PROBE("  null  ") && !any,
           "whitespace around null still means none");
-    CHECK(!crowdsec_decisions_any("{}", sizeof("{}") - 1, p, &any, &err),
-          "object root rejected");
-    CHECK(!crowdsec_decisions_any("", 0, p, &any, &err), "empty rejected");
-    CHECK(!crowdsec_decisions_any("nul", sizeof("nul") - 1, p, &any, &err),
-          "truncated null rejected");
+    CHECK(!PROBE("{}"), "object root rejected");
+    CHECK(!crowdsec_decisions_probe("", 0, p, &any, origin, sizeof(origin),
+                                    &err), "empty rejected");
+    CHECK(!PROBE("nul"), "truncated null rejected");
+
+    /* The origin is what makes a live-mode block attributable. */
+    CHECK(PROBE("[{\"value\":\"1.2.3.4\",\"origin\":\"CAPI\"}]") && any
+          && !strcmp(origin, "CAPI"), "live origin: got '%s'", origin);
+    CHECK(PROBE("[{\"value\":\"1.2.3.4\",\"origin\":\"lists\","
+                "\"scenario\":\"firehol_level1\"}]")
+          && !strcmp(origin, "lists:firehol_level1"),
+          "live blocklist origin: got '%s'", origin);
+    /* Nothing came back, so there is nothing to attribute. */
+    CHECK(PROBE("[]") && origin[0] == '\0', "empty probe clears the origin");
+    /* A decision with no origin field must not leave the caller's buffer
+     * holding the previous answer.
+     */
+    CHECK(PROBE("[{\"value\":\"1.2.3.4\",\"origin\":\"cscli\"}]")
+          && !strcmp(origin, "cscli"), "origin set");
+    CHECK(PROBE("[{\"value\":\"1.2.3.4\"}]") && origin[0] == '\0',
+          "a missing origin clears the buffer: got '%s'", origin);
+    /* An array of something that is not an object still counts as a ban - the
+     * module only asks whether anything came back - but has no origin.
+     */
+    CHECK(PROBE("[1]") && any && origin[0] == '\0',
+          "non-object decision has no origin");
+
+    /* Passing no buffer is allowed, for callers that do not care. */
+    CHECK(crowdsec_decisions_probe("[]", 2, p, &any, NULL, 0, &err) && !any,
+          "NULL origin buffer accepted");
+    /* A buffer with no room is a programming error, not a silent overflow. */
+    CHECK(!crowdsec_decisions_probe("[]", 2, p, &any, origin, 0, &err),
+          "zero-length origin buffer rejected");
+#undef PROBE
+}
+
+/* Origin parsing on the stream path, which is what attributes both dropped
+ * and active_decisions.
+ */
+static void test_stream_origin(apr_pool_t *p)
+{
+    collector_t c;
+    crowdsec_decision_stats_t st;
+    const char *err;
+
+    CHECK(run(p, "{\"new\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1h\",\"origin\":\"CAPI\"}]}", &c, &st,
+              &err), "origin: %s", err ? err : "");
+    CHECK(c.n == 1 && !strcmp(c.origin[0], "CAPI"), "plain origin: '%s'",
+          c.origin[0]);
+
+    /* The rewrite every component applies: a blocklist arrives as origin
+     * "lists" with the list name in scenario, and reporting them all as
+     * "lists" would collapse every blocklist into one line.
+     */
+    CHECK(run(p, "{\"new\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1h\",\"origin\":\"lists\","
+              "\"scenario\":\"firehol_level1\"}]}", &c, &st, &err),
+          "lists origin: %s", err ? err : "");
+    CHECK(c.n == 1 && !strcmp(c.origin[0], "lists:firehol_level1"),
+          "blocklist origin: '%s'", c.origin[0]);
+
+    /* Matched case-insensitively, like scope is: origin is a free-text
+     * column.
+     */
+    CHECK(run(p, "{\"new\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1h\",\"origin\":\"Lists\","
+              "\"scenario\":\"x\"}]}", &c, &st, &err),
+          "Lists origin: %s", err ? err : "");
+    CHECK(c.n == 1 && !strcmp(c.origin[0], "lists:x"),
+          "case-insensitive lists: '%s'", c.origin[0]);
+
+    /* "lists" with no scenario has nothing to append, so it stays as it is
+     * rather than becoming "lists:".
+     */
+    CHECK(run(p, "{\"new\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1h\",\"origin\":\"lists\"}]}", &c, &st,
+              &err), "bare lists: %s", err ? err : "");
+    CHECK(c.n == 1 && !strcmp(c.origin[0], "lists"), "bare lists: '%s'",
+          c.origin[0]);
+
+    /* Absent, empty, and wrong-typed origins all leave it empty for the
+     * caller to map to "unknown"; none of them may drop the decision, because
+     * dropping a ban fails open.
+     */
+    CHECK(run(p, "{\"new\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1h\"}]}", &c, &st, &err), "no origin: %s",
+          err ? err : "");
+    CHECK(st.added == 1 && c.n == 1 && c.origin[0][0] == '\0',
+          "missing origin kept the decision, empty label: '%s'", c.origin[0]);
+
+    CHECK(run(p, "{\"new\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1h\",\"origin\":\"\"}]}", &c, &st, &err),
+          "empty origin: %s", err ? err : "");
+    CHECK(st.added == 1 && c.origin[0][0] == '\0', "empty origin");
+
+    CHECK(run(p, "{\"new\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1h\",\"origin\":42}]}", &c, &st, &err),
+          "numeric origin: %s", err ? err : "");
+    CHECK(st.added == 1 && c.origin[0][0] == '\0', "non-string origin ignored");
+
+    /* A name longer than the slot is truncated, not dropped: a truncated
+     * attribution still beats none.
+     */
+    {
+        char json[512];
+        char name[CROWDSEC_ORIGIN_LEN + 50];
+
+        memset(name, 'z', sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+        apr_snprintf(json, sizeof(json),
+                     "{\"new\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+                     "\"duration\":\"1h\",\"origin\":\"lists\","
+                     "\"scenario\":\"%s\"}]}", name);
+        CHECK(run(p, json, &c, &st, &err), "long origin: %s", err ? err : "");
+        CHECK(st.added == 1
+              && strlen(c.origin[0]) == CROWDSEC_ORIGIN_LEN - 1,
+              "long origin truncated to the slot: %" APR_SIZE_T_FMT,
+              strlen(c.origin[0]));
+        CHECK(!strncmp(c.origin[0], "lists:zzz", 9),
+              "truncated origin keeps its prefix: '%s'", c.origin[0]);
+    }
+
+    /* Past CROWDSEC_MAX_FIELD_LEN the field is refused outright, well before
+     * truncation would apply, so the origin falls back to the bare "lists".
+     * The decision itself still stands - a scope and a value are all it needs.
+     */
+    {
+        char json[600];
+        char name[CROWDSEC_MAX_FIELD_LEN + 50];
+
+        memset(name, 'z', sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+        apr_snprintf(json, sizeof(json),
+                     "{\"new\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+                     "\"duration\":\"1h\",\"origin\":\"lists\","
+                     "\"scenario\":\"%s\"}]}", name);
+        CHECK(run(p, json, &c, &st, &err), "oversize scenario: %s",
+              err ? err : "");
+        CHECK(st.added == 1 && !strcmp(c.origin[0], "lists"),
+              "an oversize scenario leaves the bare origin: '%s'",
+              c.origin[0]);
+    }
+
+    /* A deletion's origin comes from the store, not the stream, so the parser
+     * need not supply one - but it must not corrupt anything by trying.
+     */
+    CHECK(run(p, "{\"deleted\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"origin\":\"CAPI\"}]}", &c, &st, &err), "deleted: %s",
+          err ? err : "");
+    CHECK(st.removed == 1 && c.n == 1 && c.added[0] == 0, "one removal");
 }
 
 /* ------------------------------------------------------------ appsec */
@@ -510,7 +657,8 @@ int main(void)
     test_stream_malformed_doc(p);
     test_depth_limit(p);
     test_abort(p);
-    test_decisions_any(p);
+    test_decisions_probe(p);
+    test_stream_origin(p);
     test_appsec_basic(p);
     test_appsec_challenge(p);
     test_appsec_injection(p);

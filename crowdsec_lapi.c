@@ -14,6 +14,7 @@
 #include "apr_thread_proc.h"
 
 #include "crowdsec_http.h"
+#include "crowdsec_metrics.h"
 #include "crowdsec_util.h"
 
 /* must be last: see the file for why */
@@ -49,12 +50,30 @@ apr_status_t crowdsec_meta_create(apr_pool_t *pconf,
 
 #define DECISION_VALUE_VERSION 1
 
+/* Four bytes per decision, and it stays four: the origin takes one of the two
+ * bytes that were already reserved, so the cache sizing guidance in the
+ * directive docs does not move.
+ *
+ * The version does not change with it. A value written before the origin
+ * existed has a zero there, and slot zero of the metrics origin table is
+ * "unknown" - so an older value reads as "blocked, origin unknown", which is
+ * the right answer. Rejecting it on a version mismatch would instead turn it
+ * into a cache miss, and a miss in stream mode means the client is not
+ * blocked.
+ */
 typedef struct
 {
     unsigned char version;
     unsigned char rem;
-    unsigned char reserved[2];
+    unsigned char origin;       /* slot id in the shared metrics table */
+    unsigned char reserved;
 } decision_value_t;
+
+/* Which array a family's counters live in. */
+static int net_ipt(const crowdsec_net_t *n)
+{
+    return n->family == 6 ? CROWDSEC_IPT_V6 : CROWDSEC_IPT_V4;
+}
 
 /* ------------------------------------------------------------------ store */
 
@@ -127,6 +146,12 @@ typedef struct
     plen_set_t plens6;
     apr_size_t stored;
     apr_size_t store_failures;
+    /* A full pull replaces the store, so it is the one moment we know the
+     * absolute truth about what is in it. Counted here and swapped in at the
+     * end; see the comment where that happens.
+     */
+    unsigned int full:1;
+    apr_uint32_t fresh_active[CROWDSEC_ORIGIN_MAX][CROWDSEC_IPT_MAX];
     /* A sample of keys just written, re-read after the batch to notice the
      * cache quietly evicting what we stored.
      */
@@ -161,6 +186,33 @@ static apr_status_t apply_yield(apply_ctx_t *a)
     return APR_SUCCESS;
 }
 
+/* Whether this key is already in the store, and under which origin. Only ever
+ * asked to keep the active_decisions gauge straight, so it is skipped when
+ * there is no gauge and on a full pull, which recounts from scratch: either
+ * way the answer goes unused, and on a full pull it would be six figures of
+ * extra socache reads under the global lock.
+ */
+static int probe_existing(apply_ctx_t *a, const unsigned char *key,
+                          apr_size_t keylen, unsigned char *origin)
+{
+    decision_value_t old;
+    unsigned int olen = sizeof(old);
+
+    if (!a->sconf->metrics) {
+        return 0;
+    }
+    if (a->sconf->cache_provider->retrieve(a->sconf->cache_instance, a->s, key,
+                                           (unsigned int) keylen,
+                                           (unsigned char *) &old, &olen,
+                                           a->p) != APR_SUCCESS
+        || olen != sizeof(old) || old.version != DECISION_VALUE_VERSION) {
+        return 0;
+    }
+    *origin = old.origin;
+
+    return 1;
+}
+
 static apr_status_t apply_one(void *ctx, int added,
                               const crowdsec_decision_t *d)
 {
@@ -168,6 +220,9 @@ static apr_status_t apply_one(void *ctx, int added,
     unsigned char key[CROWDSEC_KEY_MAX];
     apr_size_t keylen;
     decision_value_t val;
+    unsigned char oid, had_origin = CROWDSEC_ORIGIN_UNKNOWN;
+    int ipt = net_ipt(&d->net);
+    int had = 0;
 
     if (++a->ops >= APPLY_CHUNK_OPS) {
         apr_status_t rv;
@@ -184,11 +239,30 @@ static apr_status_t apply_one(void *ctx, int added,
         return APR_SUCCESS;     /* cannot happen; counted as a no-op if it does */
     }
 
+    /* Interning may take the metrics mutex, and we are holding the cache's.
+     * That nesting is only ever in this direction - the metrics code never
+     * touches the socache - so there is no cycle to deadlock on. It also only
+     * happens the first time each origin is seen.
+     */
+    oid = crowdsec_metrics_origin_id(a->sconf,
+                                     d->origin[0] ? d->origin : "unknown");
+
     if (!added) {
+        /* The origin has to come out of the store before the entry does: the
+         * stream says what to remove, not what it was attributed to.
+         */
+        had = probe_existing(a, key, keylen, &had_origin);
         /* A removal for something we never had is not an error. */
         a->sconf->cache_provider->remove(a->sconf->cache_instance, a->s,
                                          key, (unsigned int) keylen, a->p);
+        if (had) {
+            crowdsec_metrics_active_add(a->sconf, ipt, had_origin, -1);
+        }
         return APR_SUCCESS;
+    }
+
+    if (!a->full) {
+        had = probe_existing(a, key, keylen, &had_origin);
     }
 
     /* Every stream decision is a ban: a challenge from LAPI carries no
@@ -197,8 +271,8 @@ static apr_status_t apply_one(void *ctx, int added,
      */
     val.version = DECISION_VALUE_VERSION;
     val.rem = (unsigned char) CROWDSEC_REM_BAN;
-    val.reserved[0] = 0;
-    val.reserved[1] = 0;
+    val.origin = oid;
+    val.reserved = 0;
 
     if (a->sconf->cache_provider->store(a->sconf->cache_instance, a->s,
                                         key, (unsigned int) keylen,
@@ -210,6 +284,21 @@ static apr_status_t apply_one(void *ctx, int added,
     }
     plen_set(d->net.family == 6 ? &a->plens6 : &a->plens4, d->net.plen);
     a->stored++;
+
+    if (a->full) {
+        a->fresh_active[oid][ipt]++;
+    }
+    else if (!had) {
+        crowdsec_metrics_active_add(a->sconf, ipt, oid, 1);
+    }
+    else if (had_origin != oid) {
+        /* The same network, re-attributed - a blocklist picking up an address
+         * the community list already had, say. The population has not grown,
+         * so move the count rather than adding to it.
+         */
+        crowdsec_metrics_active_add(a->sconf, ipt, had_origin, -1);
+        crowdsec_metrics_active_add(a->sconf, ipt, oid, 1);
+    }
 
     if (a->sample_every && (a->stored % a->sample_every) == 0
         && a->samples < 32) {
@@ -304,6 +393,7 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
     a.sconf = sconf;
     a.p = ptemp;
     a.me = (apr_int64_t) getpid();
+    a.full = full ? 1 : 0;
     /* Sample roughly 1% of what we write, capped at 32 probes. */
     a.sample_every = 100;
 
@@ -350,6 +440,19 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
         plen_merge(&sconf->meta->plens4, &a.plens4, full);
         plen_merge(&sconf->meta->plens6, &a.plens6, full);
 
+        /* The active_decisions gauge is kept up to date entry by entry as
+         * incremental batches arrive, but that alone drifts upward: the
+         * socache expires an entry when its decision runs out and tells
+         * nobody, so the decrement never happens. The cache force-expiring an
+         * entry to make room is just as silent. A full pull is the one moment
+         * we know exactly what is in the store, so it replaces the gauge
+         * outright - which is also why the push thread asks for a full pull
+         * once per reporting window.
+         */
+        if (full) {
+            crowdsec_metrics_active_replace(sconf, a.fresh_active);
+        }
+
         check_retention(s, &a, &st);
         st.last_pull = apr_time_now();
         st.pulls++;
@@ -390,7 +493,7 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
  */
 static int store_probe(server_rec *s, crowdsec_server_rec *sconf,
                        const crowdsec_net_t *host, apr_pool_t *p,
-                       crowdsec_rem_t *rem)
+                       crowdsec_rem_t *rem, unsigned char *origin)
 {
     plen_set_t plens;
     unsigned char key[CROWDSEC_KEY_MAX];
@@ -412,6 +515,7 @@ static int store_probe(server_rec *s, crowdsec_server_rec *sconf,
                                            p) == APR_SUCCESS
         && vlen == sizeof(val) && val.version == DECISION_VALUE_VERSION) {
         *rem = (crowdsec_rem_t) val.rem;
+        *origin = val.origin;
         return 1;
     }
 
@@ -435,6 +539,7 @@ static int store_probe(server_rec *s, crowdsec_server_rec *sconf,
                                             p) == APR_SUCCESS
             && vlen == sizeof(val) && val.version == DECISION_VALUE_VERSION) {
             *rem = (crowdsec_rem_t) val.rem;
+            *origin = val.origin;
             return 1;
         }
     }
@@ -473,7 +578,7 @@ static unsigned int memo_hash(const char *ip)
 }
 
 static int memo_get(crowdsec_server_rec *sconf, const char *ip,
-                    crowdsec_rem_t *rem)
+                    crowdsec_rem_t *rem, unsigned char *origin)
 {
     crowdsec_memo_slot_t *slot;
     int hit = 0;
@@ -487,6 +592,7 @@ static int memo_get(crowdsec_server_rec *sconf, const char *ip,
     slot = &sconf->memo.slots[memo_hash(ip)];
     if (slot->used && slot->expiry > apr_time_now() && !strcmp(slot->ip, ip)) {
         *rem = slot->rem;
+        *origin = slot->origin;
         hit = 1;
     }
     if (sconf->memo.mutex) {
@@ -496,7 +602,7 @@ static int memo_get(crowdsec_server_rec *sconf, const char *ip,
 }
 
 static void memo_put(crowdsec_server_rec *sconf, const char *ip,
-                     crowdsec_rem_t rem)
+                     crowdsec_rem_t rem, unsigned char origin)
 {
     crowdsec_memo_slot_t *slot;
     apr_interval_time_t ttl;
@@ -513,6 +619,7 @@ static void memo_put(crowdsec_server_rec *sconf, const char *ip,
     slot = &sconf->memo.slots[memo_hash(ip)];
     apr_cpystrn(slot->ip, ip, sizeof(slot->ip));
     slot->rem = rem;
+    slot->origin = origin;
     /* The per-child lifetime, not the shared cache's: this is added to
      * CrowdsecUpdateFrequency in the time a new decision takes to apply, and
      * it only has to be long enough to keep the shared cache's global lock off
@@ -544,7 +651,8 @@ static void memo_put(crowdsec_server_rec *sconf, const char *ip,
  * own duration.
  */
 static int live_cache_get(request_rec *r, crowdsec_server_rec *sconf,
-                          const crowdsec_net_t *host, crowdsec_rem_t *rem)
+                          const crowdsec_net_t *host, crowdsec_rem_t *rem,
+                          unsigned char *origin)
 {
     unsigned char key[CROWDSEC_KEY_MAX];
     decision_value_t val;
@@ -568,6 +676,7 @@ static int live_cache_get(request_rec *r, crowdsec_server_rec *sconf,
                                         r->pool) == APR_SUCCESS
         && vlen == sizeof(val) && val.version == DECISION_VALUE_VERSION) {
         *rem = (crowdsec_rem_t) val.rem;
+        *origin = val.origin;
         hit = 1;
     }
     crowdsec_store_unlock(sconf);
@@ -576,7 +685,8 @@ static int live_cache_get(request_rec *r, crowdsec_server_rec *sconf,
 }
 
 static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
-                           const crowdsec_net_t *host, crowdsec_rem_t rem)
+                           const crowdsec_net_t *host, crowdsec_rem_t rem,
+                           unsigned char origin)
 {
     unsigned char key[CROWDSEC_KEY_MAX];
     decision_value_t val;
@@ -591,8 +701,8 @@ static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
     }
     val.version = DECISION_VALUE_VERSION;
     val.rem = (unsigned char) rem;
-    val.reserved[0] = 0;
-    val.reserved[1] = 0;
+    val.origin = origin;
+    val.reserved = 0;
 
     if (crowdsec_store_lock(sconf) != APR_SUCCESS) {
         return;
@@ -609,8 +719,10 @@ static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
 
 static crowdsec_lookup_t live_query(request_rec *r,
                                     crowdsec_server_rec *sconf,
-                                    const char *ip, crowdsec_rem_t *rem)
+                                    const char *ip, crowdsec_rem_t *rem,
+                                    unsigned char *origin)
 {
+    char origin_name[CROWDSEC_ORIGIN_LEN];
     crowdsec_http_req_t req;
     crowdsec_buf_t buf;
     crowdsec_http_err_t herr;
@@ -665,7 +777,8 @@ static crowdsec_lookup_t live_query(request_rec *r,
                       sconf->url, status);
         return CROWDSEC_LOOKUP_FAIL;
     }
-    if (!crowdsec_decisions_any(buf.data, buf.len, r->pool, &any, &perr)) {
+    if (!crowdsec_decisions_probe(buf.data, buf.len, r->pool, &any,
+                                  origin_name, sizeof(origin_name), &perr)) {
         ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
                       "crowdsec: could not parse the decisions reply: %s",
                       perr ? perr : "unknown");
@@ -675,6 +788,10 @@ static crowdsec_lookup_t live_query(request_rec *r,
      * the same reason the stream is.
      */
     *rem = any ? CROWDSEC_REM_BAN : CROWDSEC_REM_ALLOW;
+    *origin = any ? crowdsec_metrics_origin_id(sconf,
+                                               origin_name[0] ? origin_name
+                                               : "unknown")
+        : CROWDSEC_ORIGIN_UNKNOWN;
 
     return CROWDSEC_LOOKUP_OK;
 }
@@ -683,7 +800,8 @@ static crowdsec_lookup_t live_query(request_rec *r,
 
 crowdsec_lookup_t crowdsec_lapi_lookup(request_rec *r,
                                        crowdsec_server_rec *sconf,
-                                       const char *ip, crowdsec_rem_t *rem)
+                                       const char *ip, crowdsec_rem_t *rem,
+                                       unsigned char *origin)
 {
     crowdsec_net_t host;
     crowdsec_lookup_t lr;
@@ -691,8 +809,9 @@ crowdsec_lookup_t crowdsec_lapi_lookup(request_rec *r,
     int found;
 
     *rem = CROWDSEC_REM_ALLOW;
+    *origin = CROWDSEC_ORIGIN_UNKNOWN;
 
-    if (memo_get(sconf, ip, rem)) {
+    if (memo_get(sconf, ip, rem, origin)) {
         apr_table_setn(r->subprocess_env, "CROWDSEC_SOURCE", "memo");
         return CROWDSEC_LOOKUP_OK;
     }
@@ -707,15 +826,15 @@ crowdsec_lookup_t crowdsec_lapi_lookup(request_rec *r,
         /* The shared cache sits between the per-child memo and the API, so
          * one query serves every child.
          */
-        if (live_cache_get(r, sconf, &host, rem)) {
-            memo_put(sconf, ip, *rem);
+        if (live_cache_get(r, sconf, &host, rem, origin)) {
+            memo_put(sconf, ip, *rem, *origin);
             apr_table_setn(r->subprocess_env, "CROWDSEC_SOURCE", "cache");
             return CROWDSEC_LOOKUP_OK;
         }
-        lr = live_query(r, sconf, ip, rem);
+        lr = live_query(r, sconf, ip, rem, origin);
         if (lr == CROWDSEC_LOOKUP_OK) {
-            live_cache_put(r, sconf, &host, *rem);
-            memo_put(sconf, ip, *rem);
+            live_cache_put(r, sconf, &host, *rem, *origin);
+            memo_put(sconf, ip, *rem, *origin);
             apr_table_setn(r->subprocess_env, "CROWDSEC_SOURCE", "live");
         }
         return lr;
@@ -735,13 +854,14 @@ crowdsec_lookup_t crowdsec_lapi_lookup(request_rec *r,
         apr_table_setn(r->subprocess_env, "CROWDSEC_SOURCE", "unprimed");
         return CROWDSEC_LOOKUP_UNPRIMED;
     }
-    found = store_probe(r->server, sconf, &host, r->pool, rem);
+    found = store_probe(r->server, sconf, &host, r->pool, rem, origin);
     crowdsec_store_unlock(sconf);
 
     if (!found) {
         *rem = CROWDSEC_REM_ALLOW;
+        *origin = CROWDSEC_ORIGIN_UNKNOWN;
     }
-    memo_put(sconf, ip, *rem);
+    memo_put(sconf, ip, *rem, *origin);
     apr_table_setn(r->subprocess_env, "CROWDSEC_SOURCE", "cache");
 
     return CROWDSEC_LOOKUP_OK;

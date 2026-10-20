@@ -86,6 +86,33 @@ static int scope_supported(const char *scope)
         && (!strcasecmp(scope, "ip") || !strcasecmp(scope, "range"));
 }
 
+/* The origin, with the rewrite every component applies: a blocklist decision
+ * arrives as origin "lists" with the list's name in scenario, and reporting
+ * them all as "lists" would collapse every blocklist into one line.
+ *
+ * Writes at most outlen-1 bytes plus a terminator, so a name longer than a
+ * slot is truncated rather than dropped - a truncated attribution still beats
+ * none. Leaves out empty on a missing or unusable field.
+ */
+static void decision_origin(yyjson_val *item, char *out, apr_size_t outlen)
+{
+    const char *origin = str_field(item, "origin");
+    const char *scenario;
+
+    out[0] = '\0';
+    if (!origin || !*origin) {
+        return;
+    }
+    if (!strcasecmp(origin, "lists")
+        && (scenario = str_field(item, "scenario")) != NULL && *scenario) {
+        apr_size_t n = apr_cpystrn(out, "lists:", outlen) - out;
+
+        apr_cpystrn(out + n, scenario, outlen - n);
+        return;
+    }
+    apr_cpystrn(out, origin, outlen);
+}
+
 static int one_decision(yyjson_val *item, int added,
                         crowdsec_decision_cb cb, void *ctx,
                         crowdsec_decision_stats_t *stats,
@@ -133,6 +160,8 @@ static int one_decision(yyjson_val *item, int added,
             return 1;
         }
     }
+
+    decision_origin(item, d.origin, sizeof(d.origin));
 
     *cbrv = cb(ctx, added, &d);
     if (*cbrv != APR_SUCCESS) {
@@ -220,8 +249,9 @@ int crowdsec_stream_parse(const char *buf, apr_size_t len, apr_pool_t *p,
     return ok;
 }
 
-int crowdsec_decisions_any(const char *buf, apr_size_t len, apr_pool_t *p,
-                           int *any, const char **err)
+int crowdsec_decisions_probe(const char *buf, apr_size_t len, apr_pool_t *p,
+                             int *any, char *origin, apr_size_t originlen,
+                             const char **err)
 {
     yyjson_doc *doc;
     yyjson_val *root;
@@ -231,10 +261,13 @@ int crowdsec_decisions_any(const char *buf, apr_size_t len, apr_pool_t *p,
         return 0;
     }
     *err = "internal";
-    if (!any || !p) {
+    if (!any || !p || (origin && !originlen)) {
         return 0;
     }
     *any = 0;
+    if (origin) {
+        origin[0] = '\0';
+    }
 
     doc = parse_bounded(buf, len, p, err);
     if (!doc) {
@@ -251,6 +284,13 @@ int crowdsec_decisions_any(const char *buf, apr_size_t len, apr_pool_t *p,
     }
     else if (yyjson_is_arr(root)) {
         *any = yyjson_arr_size(root) > 0;
+        if (*any && origin) {
+            yyjson_val *first = yyjson_arr_get(root, 0);
+
+            if (first && yyjson_is_obj(first)) {
+                decision_origin(first, origin, originlen);
+            }
+        }
         ok = 1;
         *err = NULL;
     }

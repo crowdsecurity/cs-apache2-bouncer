@@ -38,6 +38,7 @@
 #include "crowdsec_appsec.h"
 #include "crowdsec_http.h"
 #include "crowdsec_lapi.h"
+#include "crowdsec_metrics.h"
 #include "crowdsec_util.h"
 
 /* must be last: see the file for why */
@@ -92,6 +93,11 @@ void *create_crowdsec_server_config(apr_pool_t *p, server_rec *s)
     conf->appsec_internal_path = CROWDSEC_APPSEC_INTERNAL_DEFAULT;
     conf->appsec_connect_timeout = CROWDSEC_APPSEC_CONNECT_TIMEOUT_DEFAULT;
     conf->appsec_timeout = CROWDSEC_APPSEC_TIMEOUT_DEFAULT;
+    /* On by default, like every other remediation component: an operator who
+     * installs a bouncer expects to see it in the Console.
+     */
+    conf->metrics_enable = 1;
+    conf->metrics_interval = CROWDSEC_METRICS_INTERVAL_DEFAULT;
 
     return conf;
 }
@@ -115,6 +121,8 @@ void *merge_crowdsec_server_config(apr_pool_t *p, void *basev,
     MERGE(appsec_connect_timeout);
     MERGE(appsec_timeout);
     MERGE(appsec_internal_path);
+    MERGE(metrics_enable);
+    MERGE(metrics_interval);
 
     /* appsec_socket is derived from appsec_url, so they move together. */
     new->appsec_url = (add->appsec_url_set == 0)
@@ -378,6 +386,46 @@ static const char *set_crowdsec_timeout(cmd_parms *cmd, void *dconf,
         return err;
     }
     sconf->timeout_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_metrics(cmd_parms *cmd, void *dconf, int flag)
+{
+    crowdsec_server_rec *sconf =
+        ap_get_module_config(cmd->server->module_config, &crowdsec_module);
+
+    sconf->metrics_enable = flag ? 1 : 0;
+    sconf->metrics_enable_set = 1;
+
+    return NULL;
+}
+
+static const char *set_crowdsec_metrics_interval(cmd_parms *cmd, void *dconf,
+                                                 const char *arg)
+{
+    crowdsec_server_rec *sconf =
+        ap_get_module_config(cmd->server->module_config, &crowdsec_module);
+    const char *err = parse_interval(cmd, arg, "CrowdsecMetricsInterval",
+                                     apr_time_from_sec(24 * 3600),
+                                     &sconf->metrics_interval);
+
+    if (err) {
+        return err;
+    }
+    /* A floor rather than an error, so the tests can shorten the window
+     * without the directive growing a special case. Anything under a minute
+     * is reported to the local API far more often than it can be useful.
+     */
+    if (sconf->metrics_interval < CROWDSEC_METRICS_INTERVAL_MIN) {
+        sconf->metrics_interval = CROWDSEC_METRICS_INTERVAL_MIN;
+    }
+    if (sconf->metrics_interval < apr_time_from_sec(60)) {
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, cmd->server,
+                     "crowdsec: CrowdsecMetricsInterval is under a minute; "
+                     "this is meant for testing, not for production");
+    }
+    sconf->metrics_interval_set = 1;
 
     return NULL;
 }
@@ -722,6 +770,16 @@ const command_rec crowdsec_cmds[] = {
                   "bytes per decision for headroom. Too small and decisions "
                   "are silently evicted, leaving those clients unblocked; the "
                   "error log reports it after each pull."),
+    AP_INIT_FLAG("CrowdsecMetrics", set_crowdsec_metrics, NULL, RSRC_CONF,
+                 "Whether to report usage metrics to the local API's "
+                 "/v1/usage-metrics, which is what cscli metrics show "
+                 "bouncers and the Console read. On by default wherever "
+                 "CrowdsecURL is set."),
+    AP_INIT_TAKE1("CrowdsecMetricsInterval", set_crowdsec_metrics_interval,
+                  NULL, RSRC_CONF,
+                  "How often to report usage metrics. Default 15m, matching "
+                  "the other bouncers; values under a minute are for testing "
+                  "and are warned about."),
     AP_INIT_TAKE1("CrowdsecCacheTimeout", set_crowdsec_cache_timeout, NULL,
                   RSRC_CONF,
                   "How long one address's verdict is remembered in-process. "

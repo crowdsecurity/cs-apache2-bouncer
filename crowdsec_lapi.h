@@ -37,10 +37,16 @@ apr_status_t crowdsec_meta_create(apr_pool_t *pconf,
 
 apr_status_t crowdsec_memo_init(apr_pool_t *pchild, crowdsec_server_rec *sconf);
 
-/* Answers from the memo, then the shared cache (stream) or LAPI (live). */
+/* Answers from the memo, then the shared cache (stream) or LAPI (live).
+ *
+ * *origin receives the slot id of whoever decided, for the dropped metric. It
+ * is CROWDSEC_ORIGIN_UNKNOWN whenever there is no decision behind the answer,
+ * which includes every allow.
+ */
 crowdsec_lookup_t crowdsec_lapi_lookup(request_rec *r,
                                        crowdsec_server_rec *sconf,
-                                       const char *ip, crowdsec_rem_t *rem);
+                                       const char *ip, crowdsec_rem_t *rem,
+                                       unsigned char *origin);
 
 /* Starts one poller thread per stream-mode vhost. Safe to call when no vhost
  * uses stream mode, in which case it does nothing.

@@ -13,7 +13,8 @@
  * and version instead of N/A. Not sent to AppSec: that request carries the
  * client's own User-Agent, because the rule engine fingerprints it (JA4H).
  */
-#define CROWDSEC_BOUNCER_UA "crowdsec-apache2-bouncer/" CROWDSEC_BOUNCER_VERSION
+#define CROWDSEC_BOUNCER_NAME "crowdsec-apache2-bouncer"
+#define CROWDSEC_BOUNCER_UA CROWDSEC_BOUNCER_NAME "/" CROWDSEC_BOUNCER_VERSION
 
 #include "apr.h"
 #include "apr_errno.h"
@@ -43,6 +44,12 @@ typedef struct
  * 16 address bytes.
  */
 #define CROWDSEC_KEY_MAX 19
+
+/* Longest origin string we keep: "lists:" plus a blocklist name. Shared
+ * between the decision parser, which composes it, and the metrics table, which
+ * interns it, so the two cannot disagree about what fits.
+ */
+#define CROWDSEC_ORIGIN_LEN 96
 
 /* Refuse a configured size above this. The engine's own default max_body_size
  * is 10 MiB, so anything past 64 MiB is a misconfiguration we reject at

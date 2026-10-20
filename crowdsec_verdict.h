@@ -32,6 +32,13 @@ typedef struct
 {
     crowdsec_net_t net;         /* already masked to its prefix */
     apr_interval_time_t duration;
+    /* Who decided: "crowdsec", "cscli", "CAPI", "console", or
+     * "lists:<blocklist name>" composed from origin and scenario. Inline
+     * rather than a pointer into the document, because composing it is the one
+     * thing that would otherwise allocate once per decision - and a full pull
+     * carries six figures of them. Empty when the field was absent.
+     */
+    char origin[CROWDSEC_ORIGIN_LEN];
 } crowdsec_decision_t;
 
 /* Returning anything but APR_SUCCESS aborts the parse. */
@@ -58,9 +65,16 @@ int crowdsec_stream_parse(const char *buf, apr_size_t len, apr_pool_t *p,
 /* A /v1/decisions?ip= body: null, [], or an array of decisions. LAPI has
  * already done the range matching, so the only question is whether anything
  * came back. *any is set to 0 or 1.
+ *
+ * origin receives the first decision's origin, composed the same way the
+ * stream's is, so a live-mode block can be attributed too. It is the first
+ * rather than the most severe because every decision here is enforced as a
+ * ban, so there is no severity to compare. NUL-terminated, empty when there
+ * was nothing to report; pass NULL to ignore it.
  */
-int crowdsec_decisions_any(const char *buf, apr_size_t len, apr_pool_t *p,
-                           int *any, const char **err);
+int crowdsec_decisions_probe(const char *buf, apr_size_t len, apr_pool_t *p,
+                             int *any, char *origin, apr_size_t originlen,
+                             const char **err);
 
 typedef struct
 {

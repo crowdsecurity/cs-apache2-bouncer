@@ -20,6 +20,9 @@
 
 #include "crowdsec_internal.h"
 
+/* Defined in crowdsec_metrics.c; servers only ever hold a pointer. */
+struct crowdsec_metrics_shm;
+
 #define CROWDSEC_CACHE_TIMEOUT_DEFAULT  apr_time_from_sec(60)
 #define CROWDSEC_LOCAL_CACHE_TIMEOUT_DEFAULT apr_time_from_sec(2)
 #define CROWDSEC_UPDATE_FREQ_DEFAULT    apr_time_from_sec(10)
@@ -91,6 +94,13 @@ typedef struct
     char ip[CROWDSEC_IP_MAX + 1];
     apr_time_t expiry;
     crowdsec_rem_t rem;
+    /* Which origin decided this, as a slot id in the shared metrics table. The
+     * memo answers before the store is ever consulted, and a banned client
+     * being hammered is exactly what it exists to serve - so without this,
+     * dropped would be attributed to "unknown" for most repeat visitors. Free:
+     * it lands in the struct's existing tail padding.
+     */
+    unsigned char origin;
     unsigned int used:1;
 } crowdsec_memo_slot_t;
 
@@ -140,12 +150,29 @@ typedef struct
     apr_shm_t *meta_shm;
     struct crowdsec_meta *meta;
 
+    /* usage metrics. Their counters get a region of their own rather than a
+     * slot in crowdsec_meta: metrics also run in live mode, where
+     * CrowdsecCache may not be configured and that region is never created.
+     * Shared by every server with the same (url, key), since that pair is one
+     * registration as far as the local API is concerned. Layout is private to
+     * crowdsec_metrics.c.
+     */
+    unsigned int metrics_enable:1;
+    apr_interval_time_t metrics_interval;
+    apr_global_mutex_t *metrics_mutex;
+    apr_shm_t *metrics_shm;
+    struct crowdsec_metrics_shm *metrics;
+    unsigned int metrics_owned:1;
+
     /* --- per-child runtime, set in child_init, never merged --- */
     apr_reslist_t *curl_handles;
     crowdsec_memo_t memo;
     volatile int poller_stop;
     apr_thread_t *poller;
     server_rec *poller_server;
+    volatile int metrics_stop;
+    apr_thread_t *metrics_thread;
+    server_rec *metrics_server;
 
     /* --- explicitly-set bits, for the merge --- */
     unsigned int url_set:1;
@@ -162,6 +189,8 @@ typedef struct
     unsigned int appsec_connect_timeout_set:1;
     unsigned int appsec_timeout_set:1;
     unsigned int appsec_internal_path_set:1;
+    unsigned int metrics_enable_set:1;
+    unsigned int metrics_interval_set:1;
 } crowdsec_server_rec;
 
 typedef struct

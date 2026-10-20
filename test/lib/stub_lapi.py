@@ -10,8 +10,16 @@ what the API says without restarting anything:
      "live":      [ {...} ],        # served by /v1/decisions
      "status":    200,              # force an HTTP status
      "delay":     0.0,              # stall before responding
+     "metrics_status": 201,         # force a status for /v1/usage-metrics
      "startup_seen": 0,             # written by us: counts startup=true pulls
-     "pulls": 0}                    # written by us: counts stream pulls
+     "pulls": 0,                    # written by us: counts stream pulls
+     "metrics": [ {...}, ... ],     # written by us: each payload, decoded
+     "metrics_raw": [ "..." ],      # written by us: each payload, verbatim
+     "metrics_posts": 0}            # written by us: counts metrics pushes
+
+The raw bodies are kept as well as the decoded ones because the two mistakes
+that actually break this payload - an empty array serialised as {}, and an
+unescaped label - both survive a round trip through json.loads.
 
 Decisions handed out as "new" are cleared after a pull unless "sticky" is set,
 which mirrors the real API: a startup pull repeats everything, an incremental
@@ -131,6 +139,53 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200, live if live else None)
             return
 
+        self.not_found()
+
+    def do_POST(self):
+        state = load()
+        url = urlparse(self.path)
+
+        delay = float(state.get("delay", 0))
+        if delay:
+            time.sleep(delay)
+
+        if url.path != "/v1/usage-metrics":
+            self.not_found()
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length).decode("utf-8", "replace") if length \
+            else ""
+
+        # Read-modify-write under the lock, like the stream pull: a test
+        # rewriting the fixture between pushes must not lose a recorded one.
+        with state_locked():
+            state = load()
+            state["metrics_posts"] = int(state.get("metrics_posts", 0)) + 1
+            state.setdefault("metrics_raw", []).append(raw)
+            state.setdefault("metrics_headers", {})
+            # Only the headers a test asserts on; the rest is curl's business.
+            for h in ("x-api-key", "content-type", "user-agent"):
+                if self.headers.get(h) is not None:
+                    state["metrics_headers"][h] = self.headers.get(h)
+            try:
+                state.setdefault("metrics", []).append(json.loads(raw))
+            except ValueError:
+                # Recorded as unparseable rather than dropped: a test asserting
+                # on the payload shape should fail loudly, not see nothing.
+                state.setdefault("metrics", []).append({"_unparseable": raw})
+            forced = int(state.get("metrics_status", 201))
+            save(state)
+
+        # 201 Created is what the real local API answers.
+        self.send_response(forced)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def not_found(self):
         self.send_response(404)
         self.send_header("Content-Length", "0")
         self.end_headers()

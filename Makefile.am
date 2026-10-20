@@ -43,6 +43,7 @@ EXTRA_DIST = $(CROWDSEC_SRC) $(CROWDSEC_HDRS) \
              test/bats/connect.bats test/bats/gating.bats \
              test/bats/http-client.bats test/bats/limits.bats \
              test/bats/live-mode.bats test/bats/metrics.bats \
+             test/bats/regressions.bats \
              test/bats/scan-conformance.bats \
              test/bats/stream-mode.bats \
              fuzz/README.md test/pkg/smoke.sh \

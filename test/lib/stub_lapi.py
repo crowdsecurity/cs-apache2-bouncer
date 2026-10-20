@@ -11,8 +11,10 @@ what the API says without restarting anything:
      "status":    200,              # force an HTTP status
      "delay":     0.0,              # stall before responding
      "metrics_status": 201,         # force a status for /v1/usage-metrics
+     "record_headers": false,       # keep the headers we are sent, per endpoint
      "startup_seen": 0,             # written by us: counts startup=true pulls
      "pulls": 0,                    # written by us: counts stream pulls
+     "req_headers": {...},          # written by us: headers, keyed by endpoint
      "metrics": [ {...}, ... ],     # written by us: each payload, decoded
      "metrics_raw": [ "..." ],      # written by us: each payload, verbatim
      "metrics_posts": 0}            # written by us: counts metrics pushes
@@ -93,6 +95,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def record_headers(self, state, where):
+        """Keep the headers the module sent, for the endpoint it sent them to.
+
+        Opt-in: the live endpoint is otherwise read-only, and recording would
+        turn every lookup into a locked read-modify-write. Caller holds the
+        lock and saves.
+        """
+        seen = state.setdefault("req_headers", {}).setdefault(where, {})
+        for h in ("user-agent", "x-api-key"):
+            if self.headers.get(h) is not None:
+                seen[h] = self.headers.get(h)
+
     def do_GET(self):
         state = load()
         url = urlparse(self.path)
@@ -120,6 +134,8 @@ class Handler(BaseHTTPRequestHandler):
                 if startup:
                     state["startup_seen"] = \
                         int(state.get("startup_seen", 0)) + 1
+                if state.get("record_headers"):
+                    self.record_headers(state, "stream")
 
                 new = state.get("decisions", [])
                 deleted = state.get("deleted", [])
@@ -135,6 +151,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if url.path == "/v1/decisions":
+            if state.get("record_headers"):
+                with state_locked():
+                    state = load()
+                    self.record_headers(state, "decisions")
+                    save(state)
             live = state.get("live", [])
             self.reply(200, live if live else None)
             return

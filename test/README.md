@@ -23,9 +23,12 @@ checkout — the crowdsec engine repo vendors one as a submodule:
 /path/to/crowdsec/test/lib/bats-core/bin/bats test/bats/
 ```
 
-Requires `apache2` plus `mod_mpm_prefork`, `mod_mpm_event`, `mod_authz_core`,
-`mod_dir` and `mod_socache_shmcb` in `/usr/lib/apache2/modules`, and `python3`
-for the stub API and port probing.
+Requires `apache2` plus, in `/usr/lib/apache2/modules`, `mod_mpm_prefork`,
+`mod_mpm_event`, `mod_authz_core`, `mod_dir` and `mod_socache_shmcb`;
+`mod_proxy`, `mod_proxy_http` and `mod_rewrite` for the gating tests; and
+`mod_alias`, `mod_headers`, `mod_auth_basic`, `mod_authn_core`,
+`mod_authn_file` and `mod_authz_user` for the regression tests. All ship in the
+`apache2` package. `python3` runs the stub API and the port probing.
 
 ## What is covered
 
@@ -40,6 +43,8 @@ for the stub API and port probing.
 | `appsec.bats` | what is forwarded for inspection, each verdict, failure handling |
 | `challenge.bats` | relaying the interstitial, cookies, headers, the internal endpoints, failing closed |
 | `appsec-body.bats` | body inspection and replay, the limit, drop vs bypass, chunked, gzip, LimitRequestBody |
+| `gating.bats` | which requests reach the lookup: reverse proxy, internal redirects, vhosts inheriting the cache |
+| `regressions.bats` | the issues 0.1 left open: basic auth, redirects, ProxyPreserveHost, the user agent |
 
 Both MPMs are covered; `HARNESS_MPM=event` switches, and tests needing several
 child processes use `mpm_many_children` so the directives are spelled correctly
@@ -51,6 +56,21 @@ HARNESS_MPM=event bats test/bats/
 
 Set `HARNESS_LOGLEVEL` to raise Apache's log level, e.g.
 `HARNESS_LOGLEVEL="info socache_shmcb:trace5"` when investigating the cache.
+
+Set `MODULE` to test a build other than `.libs/mod_crowdsec.so`. That is how a
+regression gets confirmed: a test in `regressions.bats` that passes against the
+version which had the bug is testing nothing, so replay it against that build
+and watch it fail first.
+
+```
+git archive v0.1 | tar -x -C /tmp/v01
+(cd /tmp/v01 && apxs2 -c -o mod_crowdsec.la mod_crowdsec.c)
+MODULE=/tmp/v01/.libs/mod_crowdsec.so bats test/bats/regressions.bats
+```
+
+0.1 has no `CrowdsecMode` and no `CrowdsecLocalCacheTimeout`, so Apache rejects
+the config `regr_conf` writes; drop those two lines to replay a case against
+it.
 
 ## Testing against a real engine
 

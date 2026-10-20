@@ -7,7 +7,10 @@ harness_init() {
     HARNESS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/csapache.XXXXXX")"
     APACHE_PORT="$(harness_free_port)"
     LAPI_PORT="$(harness_free_port)"
-    MODULE="$(cd "$BATS_TEST_DIRNAME/../.." && pwd)/.libs/mod_crowdsec.so"
+    # Overridable so a regression can be replayed against an older build of
+    # the module: a test that passes against the version that had the bug is
+    # testing nothing.
+    MODULE="${MODULE:-$(cd "$BATS_TEST_DIRNAME/../.." && pwd)/.libs/mod_crowdsec.so}"
     [ -f "$MODULE" ] || { echo "module not built: $MODULE (run: apxs -c mod_crowdsec.c)" >&2; return 1; }
     mkdir -p "$HARNESS_DIR"/{logs,htdocs,run}
     echo origin-ok > "$HARNESS_DIR/htdocs/index.html"
@@ -129,6 +132,16 @@ lapi_set() {
 lapi_get() {
     python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2],""))' \
         "$LAPI_STATE" "$1"
+}
+
+# lapi_header <endpoint> <name>   one header the module sent us, where
+# <endpoint> is "stream" or "decisions". Needs record_headers in the state
+# before the request that should be captured.
+lapi_header() {
+    python3 -c '
+import json, sys
+d = (json.load(open(sys.argv[1])).get("req_headers") or {}).get(sys.argv[2]) or {}
+print(d.get(sys.argv[3].lower(), ""))' "$LAPI_STATE" "$1" "$2"
 }
 
 # lapi_patch <key> <json value>   change one key, leaving the rest alone
@@ -377,6 +390,16 @@ LoadModule proxy_module /usr/lib/apache2/modules/mod_proxy.so
 LoadModule proxy_http_module /usr/lib/apache2/modules/mod_proxy_http.so
 LoadModule socache_shmcb_module /usr/lib/apache2/modules/mod_socache_shmcb.so
 LoadModule rewrite_module /usr/lib/apache2/modules/mod_rewrite.so
+# For regressions.bats: mod_alias and mod_headers reproduce the redirect and
+# ProxyPreserveHost reports, the auth chain reproduces the basic-auth ones.
+# Loaded for every test because LoadModule fails hard on a missing file, so
+# splicing it per test would mean restating this whole block.
+LoadModule alias_module /usr/lib/apache2/modules/mod_alias.so
+LoadModule headers_module /usr/lib/apache2/modules/mod_headers.so
+LoadModule auth_basic_module /usr/lib/apache2/modules/mod_auth_basic.so
+LoadModule authn_core_module /usr/lib/apache2/modules/mod_authn_core.so
+LoadModule authn_file_module /usr/lib/apache2/modules/mod_authn_file.so
+LoadModule authz_user_module /usr/lib/apache2/modules/mod_authz_user.so
 LoadModule crowdsec_module $MODULE
 
 <Directory "$HARNESS_DIR/htdocs">
@@ -426,4 +449,30 @@ PYEOF
 http_status() {
     curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
         "http://127.0.0.1:$APACHE_PORT/${1:-}"
+}
+
+# harness_request [path] [curl args...]
+# Echoes the status code and keeps the response, so a test can assert on the
+# status and the headers of the *same* request. The cold-cache regressions need
+# that: a second request is served from the memo and no longer reproduces.
+harness_request() {
+    local path="${1:-}"
+    shift || true
+    curl -s -D "$HARNESS_DIR/resp.head" -o "$HARNESS_DIR/resp.body" \
+        -w '%{http_code}' --max-time 10 "$@" \
+        "http://127.0.0.1:$APACHE_PORT/$path"
+}
+
+# resp_header <name>   from the last harness_request, empty if absent
+resp_header() {
+    tr -d '\r' < "$HARNESS_DIR/resp.head" | sed -n "s/^$1: //Ip"
+}
+
+# A password file for the basic-auth tests. {SHA} rather than htpasswd's own
+# format so this needs no apache2-utils.
+harness_passwd() {
+    python3 -c 'import base64, hashlib, sys
+print("%s:{SHA}%s" % (sys.argv[1], base64.b64encode(
+    hashlib.sha1(sys.argv[2].encode()).digest()).decode()))' \
+        "$1" "$2" > "$HARNESS_DIR/passwd"
 }

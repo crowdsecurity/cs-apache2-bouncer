@@ -87,25 +87,35 @@ jobs:
             rpm=$(echo "$rpm_all" | jq -c --argjson q "$quick_rpm" \
                   '[.[] | select(.name as $n | $q | index($n))]')
           fi
+
+          # The cross product with the architectures happens here rather than
+          # as a second matrix dimension with "include" supplying the runner.
+          # An include entry whose keys match no existing combination does not
+          # extend anything - it adds a combination of its own - so on a
+          # single-architecture build the arm64 runner mapping produced an
+          # extra job with no target, and docker got an empty image name.
+          runners='{"amd64":"ubuntu-24.04","arm64":"ubuntu-24.04-arm"}'
+          expand() {
+            jq -c --argjson a '${{ inputs.arches }}' --argjson r "$runners" \
+              '[ .[] as $t | $a[] as $arch
+                 | $t + {arch: $arch, runner: $r[$arch]} ]'
+          }
+          deb=$(echo "$deb" | expand)
+          rpm=$(echo "$rpm" | expand)
+
           echo "deb=$deb" >> "$GITHUB_OUTPUT"
           echo "rpm=$rpm" >> "$GITHUB_OUTPUT"
-          echo "deb targets: $deb"
-          echo "rpm targets: $rpm"
+          echo "deb jobs: $deb"
+          echo "rpm jobs: $rpm"
 
   deb:
-    name: deb ${{ matrix.target.name }} ${{ matrix.arch }}
+    name: deb ${{ matrix.job.name }} ${{ matrix.job.arch }}
     needs: targets
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.job.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ fromJSON(needs.targets.outputs.deb) }}
-        arch: ${{ fromJSON(inputs.arches) }}
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
+        job: ${{ fromJSON(needs.targets.outputs.deb) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -115,7 +125,7 @@ jobs:
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" \
             -e DEBIAN_FRONTEND=noninteractive \
             -e PKG_VERSION="${{ inputs.version }}" \
-            "${{ matrix.target.image }}" sh -ec '
+            "${{ matrix.job.image }}" sh -ec '
               # bullseye is EOL and its security suite has moved, so the stock
               # image ships apt lists that 404 on every fetch.
               if grep -q bullseye /etc/os-release; then
@@ -161,31 +171,25 @@ jobs:
           # overwrite each other as release assets.
           for f in out/*.deb; do
             b=$(basename "$f" .deb)
-            mv "$f" "out/${b%_*}_${{ matrix.target.name }}_${b##*_}.deb"
+            mv "$f" "out/${b%_*}_${{ matrix.job.name }}_${b##*_}.deb"
           done
           ls -l out/
 
       - uses: actions/upload-artifact@v4
         if: inputs.upload
         with:
-          name: deb-${{ matrix.target.name }}-${{ matrix.arch }}
+          name: deb-${{ matrix.job.name }}-${{ matrix.job.arch }}
           path: out/*.deb
           if-no-files-found: error
 
   rpm:
-    name: rpm ${{ matrix.target.name }} ${{ matrix.arch }}
+    name: rpm ${{ matrix.job.name }} ${{ matrix.job.arch }}
     needs: targets
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.job.runner }}
     strategy:
       fail-fast: false
       matrix:
-        target: ${{ fromJSON(needs.targets.outputs.rpm) }}
-        arch: ${{ fromJSON(inputs.arches) }}
-        include:
-          - arch: amd64
-            runner: ubuntu-24.04
-          - arch: arm64
-            runner: ubuntu-24.04-arm
+        job: ${{ fromJSON(needs.targets.outputs.rpm) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -194,7 +198,7 @@ jobs:
           mkdir -p out
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" \
             -e PKG_VERSION="${{ inputs.version }}" \
-            "${{ matrix.target.image }}" sh -ec '
+            "${{ matrix.job.image }}" sh -ec '
               dnf -y -q install rpm-build rpmdevtools redhat-rpm-config \
                 gcc make autoconf automake libtool pkgconf-pkg-config \
                 httpd httpd-devel apr-devel apr-util-devel libcurl-devel \
@@ -241,8 +245,8 @@ jobs:
       # the same .el9 filename almalinux:9 does, so uploading both would just
       # be one silently replacing the other.
       - uses: actions/upload-artifact@v4
-        if: inputs.upload && matrix.target.publish
+        if: inputs.upload && matrix.job.publish
         with:
-          name: rpm-${{ matrix.target.name }}-${{ matrix.arch }}
+          name: rpm-${{ matrix.job.name }}-${{ matrix.job.arch }}
           path: out/*.rpm
           if-no-files-found: error

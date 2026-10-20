@@ -28,7 +28,16 @@ most people run. What the other targets are each there for:
 
 The target list lives once, in the `targets` job, and the quick subset is a
 list of names filtered out of it — so adding a target cannot leave the two
-tiers disagreeing.
+tiers disagreeing. That job also expands the cross product with the
+architectures and resolves the runner, emitting one object per job.
+
+Do not be tempted to simplify that back into a second matrix dimension with
+`include` supplying the runner. A GitHub Actions `include` entry whose keys
+match no existing combination does not extend anything — it adds a
+combination of its own. With the quick tier's single architecture, an
+`{arch: arm64, runner: ...}` entry therefore created an extra job carrying a
+runner but **no target**, which failed with `docker: invalid reference
+format` because the image name was empty.
 
 **Run the full matrix before tagging.** The quick subset will not catch a
 regression specific to bullseye, trixie, jammy, el8 or el10; those are proven

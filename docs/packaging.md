@@ -3,12 +3,36 @@
 ## What this repo produces
 
 `.github/workflows/packages.yml` builds and install-tests one package per
-target, in a container, on a host runner:
+target, in a container, on a host runner. It is tiered, because the full
+matrix is a lot of wall clock for what actually differs between most of these
+targets:
 
-| format | targets | arch |
-|---|---|---|
-| deb | Debian bullseye, bookworm, trixie; Ubuntu 22.04, 24.04 | amd64 on every push, + arm64 on a tag |
-| rpm | AlmaLinux 8, 9, 10; Rocky 9 | same |
+| when | deb targets | rpm targets | arch | jobs |
+|---|---|---|---|---|
+| push, PR | bookworm, noble | el9 | amd64 | 3 |
+| manual run with `full_packages` | all five | all four | amd64 | 9 |
+| `v*` tag | all five | all four | amd64 + arm64 | 18 |
+
+The quick subset keeps the axes the deb packaging actually varies on —
+bookworm is non-t64 and noble is t64 — plus the EL release closest to what
+most people run. What the other targets are each there for:
+
+| target | why |
+|---|---|
+| bullseye | oldest deb; libcurl 7.74, so the pre-7.85 `setopt` path |
+| trixie | t64 names, newest debhelper |
+| jammy | libcurl 7.81, also pre-7.85 |
+| el8 | apr 1.6, python 3.6, httpd 2.4.37, full `curl` |
+| el10 | newest EL |
+| rocky9 | cross-check that the `el9` artifact is interchangeable |
+
+The target list lives once, in the `targets` job, and the quick subset is a
+list of names filtered out of it — so adding a target cannot leave the two
+tiers disagreeing.
+
+**Run the full matrix before tagging.** The quick subset will not catch a
+regression specific to bullseye, trixie, jammy, el8 or el10; those are proven
+by the manual run or by the release build itself.
 
 Each job builds the package, asserts the bouncer config is 0600 inside the
 package, installs it, and runs `test/pkg/smoke.sh` against the distro's own
@@ -62,13 +86,54 @@ Three traps when writing tests like this by hand:
 3. `.github/workflows/release.yml` checks the tag against `configure.ac`,
    builds every target for both architectures, and attaches the packages to a
    GitHub release. A `~rc` tag is published as a prerelease.
-4. Publishing the GitHub release fires the webhook that starts this product's
-   AWS CodePipeline, defined in `crowdsecurity/packaging`. That pipeline signs
-   the packages and pushes them to packagecloud:
-   `crowdsec/crowdsec-apache` for a release, `crowdsec/crowdsec-apache-testing`
-   for a prerelease.
+### What a release contains
 
-Nothing in this repo pushes to packagecloud, deliberately.
+One asset per target and architecture. The deb filenames carry the codename
+because `dpkg-buildpackage` does not put anything distro-specific in them -
+all five builds are otherwise called
+`crowdsec-apache2-bouncer_1.0.0_amd64.deb`, and as release assets they would
+overwrite one another:
+
+```
+crowdsec-apache2-bouncer_1.0.0_bullseye_amd64.deb      (and _arm64)
+crowdsec-apache2-bouncer_1.0.0_bookworm_amd64.deb
+crowdsec-apache2-bouncer_1.0.0_trixie_amd64.deb
+crowdsec-apache2-bouncer_1.0.0_jammy_amd64.deb
+crowdsec-apache2-bouncer_1.0.0_noble_amd64.deb
+crowdsec-apache2-bouncer-1.0.0-1.el8.x86_64.rpm        (and aarch64)
+crowdsec-apache2-bouncer-1.0.0-1.el9.x86_64.rpm
+crowdsec-apache2-bouncer-1.0.0-1.el10.x86_64.rpm
+crowdsec-apache2-bouncer-1.0.0-1.el*.src.rpm
+```
+
+The rpm names already include the dist tag, so they need no renaming - but
+Alma 9 and Rocky 9 produce the *same* `.el9` name, which is why Rocky is
+marked `publish: false` in the matrix: it is a cross-check that the artifact
+really is interchangeable, not a second thing to ship. Debug symbols are not
+shipped for either format.
+
+Renaming the file is safe: dpkg and rpm both read the package's own metadata,
+not its filename, so `apt install ./crowdsec-apache2-bouncer_1.0.0_noble_amd64.deb`
+behaves exactly as before.
+
+## Distribution
+
+**Today the GitHub release is the distribution channel.** Users download the
+asset for their distro and install it with `apt install ./...deb` or
+`dnf install ./...rpm`.
+
+Nothing in this repo pushes to packagecloud, and it should stay that way:
+publishing a GitHub release fires the webhook that starts this product's AWS
+CodePipeline, defined in `crowdsecurity/packaging`, which signs and pushes to
+`crowdsec/crowdsec-apache` (release) or `crowdsec/crowdsec-apache-testing`
+(prerelease).
+
+That lane is **not ready for these packages yet**, which is why releases are
+the channel for now. Two hard blockers and one correctness bug, detailed
+below: rpms are never built (`disable_rpm = true`), rpms would be pushed to
+the shared `crowdsec` repository next to the engine (`update_rpm` has no
+`APACHE_BOUNCER` branch), and the deb publish step ships one bookworm build to
+every distro target.
 
 ## Changes still needed in crowdsecurity/packaging
 

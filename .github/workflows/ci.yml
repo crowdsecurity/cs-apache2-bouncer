@@ -11,6 +11,14 @@ on:
   pull_request:
     paths-ignore:
       - "**.md"
+  # So the full packaging matrix can be proven before tagging, without
+  # carrying it on every push.
+  workflow_dispatch:
+    inputs:
+      full_packages:
+        description: build every packaging target, not just the quick subset
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -198,6 +206,12 @@ jobs:
   # Per-target build and install test. The old job here built one deb on the
   # runner and only listed its contents, so nothing checked that the package
   # installs, that the maintainer scripts work, or that the config lands 0600.
+  #
+  # A quick subset by default - two debs and one rpm. The remaining targets
+  # differ in ways that are proven before a release rather than on every
+  # push; run this workflow manually with full_packages to get all of them.
   packages:
     name: packages
     uses: ./.github/workflows/packages.yml
+    with:
+      full: ${{ github.event_name == 'workflow_dispatch' && inputs.full_packages }}

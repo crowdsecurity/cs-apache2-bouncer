@@ -39,6 +39,7 @@ jobs:
     needs: version
     uses: ./.github/workflows/packages.yml
     with:
+      full: true
       arches: '["amd64","arm64"]'
       upload: true
 

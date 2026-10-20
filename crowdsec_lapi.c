@@ -44,30 +44,79 @@ apr_status_t crowdsec_meta_create(apr_pool_t *pconf,
     }
     sconf->meta = apr_shm_baseaddr_get(sconf->meta_shm);
     memset(sconf->meta, 0, sizeof(*sconf->meta));
+    /* Generation 0 means "none", which is what lets gen_applying be tested as
+     * a plain nonzero, so the first live generation is 1.
+     */
+    sconf->meta->gen = 1;
+    sconf->meta->gen_seq = 1;
 
     return APR_SUCCESS;
 }
 
-#define DECISION_VALUE_VERSION 1
+#define DECISION_VALUE_VERSION 2
 
-/* Four bytes per decision, and it stays four: the origin takes one of the two
- * bytes that were already reserved, so the cache sizing guidance in the
- * directive docs does not move.
+/* Five bytes per decision. Shmcb's own per-entry overhead dominates either
+ * way - the directive docs budget ~128 bytes per decision - so the sizing
+ * guidance does not move.
  *
- * The version does not change with it. A value written before the origin
- * existed has a zero there, and slot zero of the metrics origin table is
- * "unknown" - so an older value reads as "blocked, origin unknown", which is
- * the right answer. Rejecting it on a version mismatch would instead turn it
- * into a cache miss, and a miss in stream mode means the client is not
- * blocked.
+ * The generation is split into two bytes rather than declared apr_uint16_t so
+ * the struct has no padding: it is memcpy'd into the socache whole, and
+ * padding would be an uninitialised read on every store.
+ *
+ * Adding it is what bumps the version, because the layout changed and a
+ * four-byte value read as five would be nonsense. That costs nothing in
+ * practice: the socache and this control region are created together in
+ * post_config and recreated together on a restart, so values from an older
+ * layout never coexist with this code. It does mean a version mismatch must
+ * read as a miss, and in stream mode a miss means the client is not blocked.
  */
 typedef struct
 {
     unsigned char version;
     unsigned char rem;
     unsigned char origin;       /* slot id in the shared metrics table */
-    unsigned char reserved;
+    unsigned char gen_hi;
+    unsigned char gen_lo;
 } decision_value_t;
+
+/* Hands out the next generation, skipping 0 - see crowdsec_meta. Caller holds
+ * the lock.
+ */
+static apr_uint16_t gen_take(crowdsec_server_rec *sconf)
+{
+    apr_uint16_t n = (apr_uint16_t) (sconf->meta->gen_seq + 1);
+
+    sconf->meta->gen_seq = n ? n : 1;
+
+    return sconf->meta->gen_seq;
+}
+
+static void gen_put(decision_value_t *v, apr_uint16_t g)
+{
+    v->gen_hi = (unsigned char) (g >> 8);
+    v->gen_lo = (unsigned char) (g & 0xffu);
+}
+
+/* Whether this value belongs to the snapshot in force. Caller holds the lock,
+ * which every reader of meta already does.
+ */
+static int gen_ok(const crowdsec_server_rec *sconf, const decision_value_t *v)
+{
+    apr_uint16_t g = (apr_uint16_t) ((v->gen_hi << 8) | v->gen_lo);
+
+    return g == sconf->meta->gen
+        || (sconf->meta->gen_applying && g == sconf->meta->gen_applying);
+}
+
+/* Both halves of the test every read does: the wrong layout and the wrong
+ * snapshot are the same answer, a miss.
+ */
+static int value_ok(const crowdsec_server_rec *sconf,
+                    const decision_value_t *v, unsigned int vlen)
+{
+    return vlen == sizeof(*v) && v->version == DECISION_VALUE_VERSION
+        && gen_ok(sconf, v);
+}
 
 /* Which array a family's counters live in. */
 static int net_ipt(const crowdsec_net_t *n)
@@ -151,6 +200,7 @@ typedef struct
      * end; see the comment where that happens.
      */
     unsigned int full:1;
+    apr_uint16_t gen;           /* generation this batch writes */
     apr_uint32_t fresh_active[CROWDSEC_ORIGIN_MAX][CROWDSEC_IPT_MAX];
     /* A sample of keys just written, re-read after the batch to notice the
      * cache quietly evicting what we stored.
@@ -205,7 +255,7 @@ static int probe_existing(apply_ctx_t *a, const unsigned char *key,
                                            (unsigned int) keylen,
                                            (unsigned char *) &old, &olen,
                                            a->p) != APR_SUCCESS
-        || olen != sizeof(old) || old.version != DECISION_VALUE_VERSION) {
+        || !value_ok(a->sconf, &old, olen)) {
         return 0;
     }
     *origin = old.origin;
@@ -272,7 +322,7 @@ static apr_status_t apply_one(void *ctx, int added,
     val.version = DECISION_VALUE_VERSION;
     val.rem = (unsigned char) CROWDSEC_REM_BAN;
     val.origin = oid;
-    val.reserved = 0;
+    gen_put(&val, a->gen);
 
     if (a->sconf->cache_provider->store(a->sconf->cache_instance, a->s,
                                         key, (unsigned int) keylen,
@@ -422,6 +472,19 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
         }
     }
 
+    /* After the lease check, so the discard path above has nothing to undo.
+     * A full pull takes a fresh generation and publishes it as the one being
+     * applied; lookups accept both it and the live one until the commit below
+     * makes it the live one, because the apply drops the lock in slices.
+     */
+    if (full) {
+        a.gen = gen_take(sconf);
+        sconf->meta->gen_applying = a.gen;
+    }
+    else {
+        a.gen = sconf->meta->gen;
+    }
+
     /* The lock is held in slices of APPLY_CHUNK_OPS stores - see apply_yield -
      * so a startup pull neither takes six figures of locks nor starves every
      * request lookup for the whole apply.
@@ -440,16 +503,27 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
         plen_merge(&sconf->meta->plens4, &a.plens4, full);
         plen_merge(&sconf->meta->plens6, &a.plens6, full);
 
-        /* The active_decisions gauge is kept up to date entry by entry as
-         * incremental batches arrive, but that alone drifts upward: the
-         * socache expires an entry when its decision runs out and tells
-         * nobody, so the decrement never happens. The cache force-expiring an
-         * entry to make room is just as silent. A full pull is the one moment
-         * we know exactly what is in the store, so it replaces the gauge
-         * outright - which is also why the push thread asks for a full pull
-         * once per reporting window.
-         */
         if (full) {
+            /* And the same for the entries themselves: a decision the snapshot
+             * has stopped carrying stays in the socache - there is no way to
+             * enumerate it and delete it - so retiring the generation it was
+             * written in is what stops it matching. It then ages out on its
+             * own expiry. Without this, a deletion the previous leader
+             * consumed before dying would keep blocking its client for the
+             * decision's full duration.
+             */
+            sconf->meta->gen = a.gen;
+            sconf->meta->gen_applying = 0;
+
+            /* The active_decisions gauge is kept up to date entry by entry as
+             * incremental batches arrive, but that alone drifts upward: the
+             * socache expires an entry when its decision runs out and tells
+             * nobody, so the decrement never happens. The cache force-expiring
+             * an entry to make room is just as silent. A full pull is the one
+             * moment we know exactly what is in the store, so it replaces the
+             * gauge outright - which is also why the push thread asks for a
+             * full pull once per reporting window.
+             */
             crowdsec_metrics_active_replace(sconf, a.fresh_active);
         }
 
@@ -461,6 +535,19 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
         }
         sconf->meta->stats = st;
         sconf->meta->primed_at = st.primed_at;
+    }
+
+    if (full && !parsed && a.locked) {
+        /* Nothing was committed, so the generation we were writing is not a
+         * snapshot and the entries already stored under it stop matching here.
+         * The number itself is spent: gen_seq moved when we took it, so the
+         * next full pull cannot hand it out again and revive them.
+         *
+         * apply_yield can also return with the lock lost, and then this cannot
+         * run; the generation stays accepted until the next full pull commits.
+         * Not worth an unlock path of its own.
+         */
+        sconf->meta->gen_applying = 0;
     }
 
     if (a.locked) {
@@ -513,7 +600,7 @@ static int store_probe(server_rec *s, crowdsec_server_rec *sconf,
                                            (unsigned int) keylen,
                                            (unsigned char *) &val, &vlen,
                                            p) == APR_SUCCESS
-        && vlen == sizeof(val) && val.version == DECISION_VALUE_VERSION) {
+        && value_ok(sconf, &val, vlen)) {
         *rem = (crowdsec_rem_t) val.rem;
         *origin = val.origin;
         return 1;
@@ -537,7 +624,7 @@ static int store_probe(server_rec *s, crowdsec_server_rec *sconf,
                                             (unsigned int) keylen,
                                             (unsigned char *) &val, &vlen,
                                             p) == APR_SUCCESS
-            && vlen == sizeof(val) && val.version == DECISION_VALUE_VERSION) {
+            && value_ok(sconf, &val, vlen)) {
             *rem = (crowdsec_rem_t) val.rem;
             *origin = val.origin;
             return 1;
@@ -644,11 +731,16 @@ static void memo_put(crowdsec_server_rec *sconf, const char *ip,
  * every child process would query the API separately for the same client, so
  * a server with 150 children would multiply the API traffic by 150.
  *
- * This reuses the decision key space, which is safe because live and stream
- * are mutually exclusive for a vhost. The difference is that live mode stores
- * allow as well as ban - absence means "not asked yet" rather than "allowed" -
- * and expires entries after CrowdsecCacheTimeout rather than the decision's
- * own duration.
+ * This reuses the decision key space, which is only safe as long as no two
+ * servers sharing a cache disagree on the mode: a live-mode allow sits at the
+ * full-width key, and store_probe answers from the exact address before it
+ * ever reaches the shorter prefixes, so it would shadow a stream range ban.
+ * post_config refuses that configuration at startup rather than leaving this
+ * as an assumption.
+ *
+ * The difference is that live mode stores allow as well as ban - absence means
+ * "not asked yet" rather than "allowed" - and expires entries after
+ * CrowdsecCacheTimeout rather than the decision's own duration.
  */
 static int live_cache_get(request_rec *r, crowdsec_server_rec *sconf,
                           const crowdsec_net_t *host, crowdsec_rem_t *rem,
@@ -660,7 +752,7 @@ static int live_cache_get(request_rec *r, crowdsec_server_rec *sconf,
     unsigned int vlen = sizeof(val);
     int hit = 0;
 
-    if (!sconf->cache_instance) {
+    if (!sconf->cache_instance || !sconf->meta) {
         return 0;
     }
     keylen = crowdsec_key_encode(host, key, sizeof(key));
@@ -674,7 +766,7 @@ static int live_cache_get(request_rec *r, crowdsec_server_rec *sconf,
                                         (unsigned int) keylen,
                                         (unsigned char *) &val, &vlen,
                                         r->pool) == APR_SUCCESS
-        && vlen == sizeof(val) && val.version == DECISION_VALUE_VERSION) {
+        && value_ok(sconf, &val, vlen)) {
         *rem = (crowdsec_rem_t) val.rem;
         *origin = val.origin;
         hit = 1;
@@ -692,7 +784,7 @@ static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
     decision_value_t val;
     apr_size_t keylen;
 
-    if (!sconf->cache_instance) {
+    if (!sconf->cache_instance || !sconf->meta) {
         return;
     }
     keylen = crowdsec_key_encode(host, key, sizeof(key));
@@ -702,11 +794,14 @@ static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
     val.version = DECISION_VALUE_VERSION;
     val.rem = (unsigned char) rem;
     val.origin = origin;
-    val.reserved = 0;
 
     if (crowdsec_store_lock(sconf) != APR_SUCCESS) {
         return;
     }
+    /* Under the lock, because meta is only ever read there. Live mode runs no
+     * poller, so this is always the one generation the server ever has.
+     */
+    gen_put(&val, sconf->meta->gen);
     sconf->cache_provider->store(sconf->cache_instance, r->server, key,
                                  (unsigned int) keylen,
                                  apr_time_now() + sconf->cache_timeout,

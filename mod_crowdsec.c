@@ -338,7 +338,8 @@ static int crowdsec_check_access(request_rec *r)
      * <Location> enabled appsec, so without this the engine would never be
      * consulted for them, the origin would 404, and a challenged visitor would
      * be stuck for good - not blocked, not allowed. This is the one place the
-     * module deliberately overrides a per-directory off.
+     * module deliberately overrides a per-directory off, and the whole prefix
+     * is reserved for it.
      *
      * Matched on r->uri, which Apache has already decoded and collapsed, so a
      * traversal cannot slip past; the engine is still sent r->unparsed_uri,
@@ -512,14 +513,17 @@ static int crowdsec_check_access(request_rec *r)
         return crowdsec_apply(r, conf, rem, ip);
     }
 
-    /* Allowed. A challenge asset must never reach the origin even so: the
-     * engine answers those itself and the origin has nothing to serve.
+    /* Allowed. Nothing under the challenge prefix may reach the origin even
+     * so: the engine answers what it owns there and the origin has nothing to
+     * serve. Logged at debug because the engine routes only a few paths under
+     * the prefix, so anyone can reach this with a made-up one - it is the
+     * expected answer for those, not a fault.
      */
     if (challenge_path) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
-                      "crowdsec: '%s' is a challenge endpoint but the engine "
-                      "did not answer it; refusing rather than passing it to "
-                      "the origin", r->uri);
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "crowdsec: '%s' is under the challenge prefix but the "
+                      "engine did not answer it; refusing rather than passing "
+                      "it to the origin", r->uri);
         return HTTP_NOT_FOUND;
     }
 
@@ -602,7 +606,7 @@ static int crowdsec_post_config(apr_pool_t *pconf, apr_pool_t *plog,
     int remoteip_loaded = ap_find_linked_module("mod_remoteip.c") != NULL;
 
     /* avg_id_len is 18: our longest key is family + prefix + 16 address bytes.
-     * avg_obj_size is 32, comfortably over the 4-byte decision value, so the
+     * avg_obj_size is 32, comfortably over the 5-byte decision value, so the
      * provider sizes its subcaches for many small entries.
      */
     static struct ap_socache_hints cache_hints = { 18, 32, 60000000 };
@@ -731,6 +735,48 @@ static int crowdsec_post_config(apr_pool_t *pconf, apr_pool_t *plog,
                          "crowdsec: the decision cache has no owning server; "
                          "refusing to use it without a lock");
             return 500;
+        }
+    }
+
+    /* Live and stream share one key space in that cache, and live mode stores
+     * allow at the full-width key while stream stores ban at the prefix - so a
+     * lookup answering from the exact address would let one server's cached
+     * allow shadow another's range ban. CrowdsecCache is main-server-only but
+     * CrowdsecMode is not, so the mismatch is reachable by configuration;
+     * refuse it here instead of failing open on some requests at runtime.
+     *
+     * Only servers with a CrowdsecURL count, and the first of them sets the
+     * reference rather than the cache's owner: an AppSec-only vhost never
+     * reaches the decision cache, and neither does a main server that declares
+     * the cache for its vhosts without polling itself. Either would otherwise
+     * impose the mode it never uses.
+     */
+    {
+        crowdsec_server_rec *ref = NULL;
+
+        for (s_vhost = s; s_vhost; s_vhost = s_vhost->next) {
+            crowdsec_server_rec *sconf =
+                ap_get_module_config(s_vhost->module_config, &crowdsec_module);
+
+            if (!sconf->cache_instance || !sconf->url) {
+                continue;
+            }
+            if (!ref) {
+                ref = sconf;
+                continue;
+            }
+            if (ref->cache_instance == sconf->cache_instance
+                && ref->mode != sconf->mode) {
+                ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
+                             "crowdsec: this server shares a CrowdsecCache "
+                             "with one in CrowdsecMode %s, so it cannot be %s. "
+                             "Use one mode for every server sharing the cache.",
+                             ref->mode == CROWDSEC_MODE_STREAM
+                             ? "stream" : "live",
+                             sconf->mode == CROWDSEC_MODE_STREAM
+                             ? "stream" : "live");
+                return 500;
+            }
         }
     }
     return OK;

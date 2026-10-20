@@ -169,6 +169,59 @@ Crowdsec On"
     [ "$(http_status)" = 429 ]
 }
 
+@test "a full pull retires a ban the snapshot no longer carries" {
+    # The other half of the resync above. A full snapshot only ever stored
+    # entries, so a deletion the previous leader consumed before dying was
+    # never applied and never resent: the ban stayed in the cache for the
+    # decision's whole duration, and the exact-address probe found it even
+    # though the snapshot had stopped carrying it.
+    #
+    # Sticky and the default 1h duration, so nothing here can expire on its
+    # own - only a full pull that retires what it no longer sees can clear it.
+    lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip)],\"sticky\":true}"
+    apache_start "$(stream_conf 'CrowdsecLocalCacheTimeout 1s')"
+    wait_primed
+    [ "$(http_status)" = 429 ]
+
+    # Force a full pull the same way: break the API so a pull fails, which sets
+    # need_full, then heal with a snapshot that no longer carries the ban.
+    lapi_set '{"status":500}'
+    sleep 3
+    lapi_set '{"decisions":[],"sticky":true}'
+
+    for _ in $(seq 60); do
+        [ "$(lapi_get startup_seen)" != "" ] \
+            && [ "$(lapi_get startup_seen)" -ge 1 ] && break
+        sleep 0.2
+    done
+    [ "$(lapi_get startup_seen)" -ge 1 ]
+
+    # Past the 1s per-child memo, so the allow below comes from the store
+    # rather than from a slot still holding the earlier ban.
+    sleep 2
+    [ "$(http_status)" = 200 ]
+}
+
+@test "a full pull that fails to parse leaves the previous snapshot enforced" {
+    # The other side of the generation swap. A full pull publishes the
+    # generation it is about to write before applying, because lookups have to
+    # keep working while it does. The risk is that a pull which then fails
+    # leaves the store answering from a snapshot that was never finished, so
+    # this pins the only outcome that is safe: the last good snapshot still
+    # decides, and nobody it had already blocked gets let through.
+    lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip)],\"sticky\":true}"
+    apache_start "$(stream_conf 'CrowdsecLocalCacheTimeout 1s')"
+    wait_primed
+    [ "$(http_status)" = 429 ]
+
+    # Fail in the parser rather than the transport, so the apply is entered
+    # and abandoned instead of never starting.
+    lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip)],\"sticky\":true,\"stream_body\":\"{\\\"new\\\": [\"}"
+    sleep 4
+
+    [ "$(http_status)" = 429 ]
+}
+
 @test "the first pull asks for the full set" {
     lapi_set "{\"decisions\":[],\"sticky\":true}"
     apache_start "$(stream_conf)"

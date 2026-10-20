@@ -9,6 +9,9 @@ what the API says without restarting anything:
      "deleted":   [ {...}, ... ],
      "live":      [ {...} ],        # served by /v1/decisions
      "status":    200,              # force an HTTP status
+     "stream_body": "...",          # serve this verbatim instead of the JSON,
+                                    # so a pull can fail in the parser rather
+                                    # than in the transport
      "delay":     0.0,              # stall before responding
      "metrics_status": 201,         # force a status for /v1/usage-metrics
      "record_headers": false,       # keep the headers we are sent, per endpoint
@@ -87,8 +90,8 @@ def save(state):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def reply(self, code, payload):
-        body = json.dumps(payload).encode()
+    def reply(self, code, payload, raw=None):
+        body = raw.encode() if raw is not None else json.dumps(payload).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -147,7 +150,7 @@ class Handler(BaseHTTPRequestHandler):
                     state["decisions"] = []
                     state["deleted"] = []
                 save(state)
-            self.reply(200, payload)
+            self.reply(200, payload, state.get("stream_body"))
             return
 
         if url.path == "/v1/decisions":

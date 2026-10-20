@@ -122,10 +122,12 @@ sudo cscli collections install crowdsecurity/appsec-bot-challenge
 sudo systemctl reload crowdsec
 ```
 
-The challenge serves its own assets from `CrowdsecAppsecInternalPath`
-(`/crowdsec-internal/challenge/` by default). Those paths are always sent to
-AppSec, including where `Crowdsec` is otherwise `Off`, because a challenged
-visitor cannot complete without them.
+The challenge serves its own assets and submissions from
+`CrowdsecAppsecInternalPath` (`/crowdsec-internal/challenge/` by default).
+Everything under that prefix is reserved for the engine: it is always sent to
+AppSec, including where `Crowdsec` is otherwise `Off` - a challenged visitor
+cannot complete without it - and never reaches the origin. A path under the
+prefix the engine does not answer gets a 404.
 
 ### Behind a reverse proxy
 
@@ -210,9 +212,9 @@ Scope column: **S** = server/vhost only, **S+D** = also valid in
 |---|---|---|---|
 | `CrowdsecURL` | S | — | Base URL of the local API, e.g. `http://localhost:8080`. |
 | `CrowdsecAPIKey` | S | — | Bouncer key from `cscli bouncers add`. |
-| `CrowdsecMode` | S | `live` | `live` or `stream`. `stream` requires `CrowdsecCache`. |
+| `CrowdsecMode` | S | `live` | `live` or `stream`. `stream` requires `CrowdsecCache`. Servers sharing a cache must agree on the mode; a mismatch is refused at startup. |
 | `CrowdsecUpdateFrequency` | S | `10s` | Decision stream poll interval. |
-| `CrowdsecCache` | S | — | Shared decision cache, e.g. `shmcb:crowdsec(16777216)`. Required by stream mode. Budget ~128 bytes per decision: 100,000 decisions need at least 6 MB, 1,000,000 fit in 128 MB. Undersized, decisions are evicted and those clients go unblocked; the error log reports it after each pull. |
+| `CrowdsecCache` | S | — | Shared decision cache, e.g. `shmcb:crowdsec(16777216)`. Main server only; vhosts inherit it. Required by stream mode. Budget ~128 bytes per decision: 100,000 decisions need at least 6 MB, 1,000,000 fit in 128 MB. Undersized, decisions are evicted and those clients go unblocked; the error log reports it after each pull. |
 | `CrowdsecCacheTimeout` | S | `60s` | How long one address's verdict is held in the **shared** cache. Live mode only: it is what stops every child querying the API for the same client. |
 | `CrowdsecLocalCacheTimeout` | S | `2s` | How long one address's verdict is held **within a single Apache child**, in front of the shared cache. Added to `CrowdsecUpdateFrequency` in the time a new decision takes to apply, so keep it small. Capped at `CrowdsecCacheTimeout`. |
 | `CrowdsecConnectTimeout` | S | `1s` | Connection timeout to the local API. |
@@ -255,7 +257,7 @@ AppSec datasource has none; the error log says so at startup.
 | `CrowdsecAppsecTimeout` | S | `1s` | Total budget for one AppSec request, excluding time reading the client body. |
 | `CrowdsecAppsecBodyLimit` | S+D | `1m` | How much request body to forward. `0` forwards none, leaving the WAF blind to anything in a body. Buffered per in-flight request, so the worst case is this × `MaxRequestWorkers`. |
 | `CrowdsecAppsecBodyLimitAction` | S+D | `drop` | A body over the limit: `drop` blocks it, `bypass` lets it through **uninspected**. |
-| `CrowdsecAppsecInternalPath` | S | `/crowdsec-internal/challenge/` | Prefix the challenge serves its assets and submissions from. |
+| `CrowdsecAppsecInternalPath` | S | `/crowdsec-internal/challenge/` | Prefix the challenge serves its assets and submissions from. Everything under it goes to AppSec and never to the origin. Must match the engine, which has this path compiled in. |
 
 ## Known limits
 
@@ -323,5 +325,11 @@ protected scope through `mod_rewrite` or `ErrorDocument` has already had its
 body consumed, so only its headers and URI go to AppSec. The decision lookup
 still applies in full.
 
-**`CrowdsecLocation` and `CrowdsecAppsecInternalPath` are untested.** They work
-as described but have no automated coverage.
+**`CrowdsecLocation` is untested.** It works as described but has no automated
+coverage.
+
+**`CrowdsecAppsecInternalPath` has no working value but the default.** The
+engine has its challenge prefix compiled in, so the interstitial asks the
+browser for `/crowdsec-internal/challenge/...` whatever this is set to.
+Changing it stops those requests being forwarded and leaves challenged
+visitors stuck.

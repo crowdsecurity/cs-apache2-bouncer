@@ -33,6 +33,25 @@ struct crowdsec_meta
 {
     lease_t lease;
     apr_time_t primed_at;
+    /* Which snapshot the live entries belong to. A full pull cannot delete
+     * what it has stopped carrying - shmcb has no way to enumerate its
+     * entries - so it writes a new generation instead, and a lookup reads an
+     * older one as a miss.
+     *
+     * gen is the generation in force. gen_applying is the one a full pull is
+     * writing right now, or 0: the apply drops the lock in slices, so a
+     * lookup running between two of them has to accept both. gen_seq is the
+     * last number handed out, which is why it is separate from gen - a full
+     * pull that dies part-way has already written entries under its number,
+     * and reusing that number later would accept them.
+     *
+     * 16 bits rather than 8 because the metrics thread asks for a full pull
+     * once per reporting window: a byte would wrap in about 64 hours at the
+     * 15m default, which is well inside the lifetime of a long decision.
+     */
+    apr_uint16_t gen;
+    apr_uint16_t gen_applying;
+    apr_uint16_t gen_seq;
     crowdsec_store_stats_t stats;
     plen_set_t plens4;
     plen_set_t plens6;

@@ -33,8 +33,8 @@ typedef struct
 
 void crowdsec_appsec_register(apr_pool_t *p);
 
-/* True for the challenge's own assets and submit endpoint. Matched on the
- * decoded path so a traversal cannot dodge it.
+/* True for anything under the prefix the challenge serves itself from.
+ * Matched on the decoded path so a traversal cannot dodge it.
  */
 int crowdsec_is_challenge_path(const char *uri, const char *prefix);
 

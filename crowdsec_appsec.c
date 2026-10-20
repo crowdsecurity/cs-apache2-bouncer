@@ -58,34 +58,19 @@ static int hop_by_hop(const char *name)
 int crowdsec_is_challenge_path(const char *uri, const char *prefix)
 {
     /* The engine routes on the value of X-Crowdsec-Appsec-Uri, so this is only
-     * about deciding to consult it at all, and never letting these reach the
-     * origin.
+     * about deciding to consult it at all, and never letting anything under
+     * the prefix reach the origin.
      *
-     * Matched against the exact filenames rather than a prefix wildcard, so
-     * the carve-out - which deliberately overrides a per-directory Crowdsec
-     * off - stays bounded. Keep in step with
-     * pkg/appsec/challenge/challenge.go.
+     * The whole prefix is matched rather than the engine's individual asset
+     * names: a route added to pkg/appsec/challenge would otherwise go
+     * unforwarded until this module caught up, leaving a challenged visitor
+     * waiting for an asset forever. The prefix ends in a slash - the
+     * directive enforces it - so a sibling directory cannot match.
      */
-    static const char *const names[] = {
-        "challenge.js", "pow-worker.js", "fpscanner.js", "custom.js",
-        "submit", NULL
-    };
-    apr_size_t plen;
-    int i;
-
     if (!uri || !prefix || !*prefix) {
         return 0;
     }
-    plen = strlen(prefix);
-    if (strncmp(uri, prefix, plen)) {
-        return 0;
-    }
-    for (i = 0; names[i]; i++) {
-        if (!strcmp(uri + plen, names[i])) {
-            return 1;
-        }
-    }
-    return 0;
+    return !strncmp(uri, prefix, strlen(prefix));
 }
 
 /* ------------------------------------------------------------- body input */

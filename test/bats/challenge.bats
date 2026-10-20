@@ -141,15 +141,28 @@ CrowdsecAppsec Off"
     [ "$(appsec_calls)" -ge 5 ]
 }
 
-@test "the carve-out is bounded to the real endpoint names" {
-    # A prefix wildcard would let anything under the prefix bypass a
-    # per-directory off, so only the known names are carved out.
+@test "the whole prefix is carved out, not just today's endpoint names" {
+    # Matching the engine's individual asset names would leave a route it
+    # gains later unforwarded, and a challenged visitor waiting for it.
     appsec_set "$(challenge_state)"
     apache_start "CrowdsecAppsecURL http://127.0.0.1:$APPSEC_PORT
 Crowdsec Off
 CrowdsecAppsec Off"
     run curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
         "http://127.0.0.1:$APACHE_PORT/crowdsec-internal/challenge/anything-else"
+    [ "$output" = 200 ]
+    [ "$(appsec_calls)" -ge 1 ]
+}
+
+@test "the carve-out stops at the prefix" {
+    # The prefix ends in a slash, so a sibling directory is not carved out and
+    # a per-directory off still holds there.
+    appsec_set "$(challenge_state)"
+    apache_start "CrowdsecAppsecURL http://127.0.0.1:$APPSEC_PORT
+Crowdsec Off
+CrowdsecAppsec Off"
+    run curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+        "http://127.0.0.1:$APACHE_PORT/crowdsec-internal/challenge-elsewhere/submit"
     [ "$output" = 404 ]
     [ "$(appsec_calls)" = 0 ]
 }
@@ -166,7 +179,7 @@ CrowdsecAppsec Off"
     [ "$(appsec_calls)" -ge 1 ]
 }
 
-@test "a challenge endpoint the engine declines is refused, not proxied" {
+@test "a path under the prefix the engine declines is refused, not proxied" {
     # If the engine says allow for one of its own endpoints, the origin still
     # has nothing to serve there, so passing it on would be wrong.
     appsec_set '{"action":"allow","http_status":200}'

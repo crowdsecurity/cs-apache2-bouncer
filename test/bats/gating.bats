@@ -175,3 +175,45 @@ CONF
         -H "Host: second.example" "http://127.0.0.1:$APACHE_PORT/"
     [ "$output" = 429 ]
 }
+
+# A vhost can set CrowdsecMode but cannot set CrowdsecCache, so it can end up
+# in the other mode on the main server's cache. Both modes use the same keys,
+# and live mode stores allow at the full-width key where store_probe looks
+# first, so a cached allow would answer ahead of a stream range ban.
+#
+# Only servers that actually query the API are compared, so a main server
+# declaring the cache for its vhosts without a CrowdsecURL of its own does not
+# impose its default mode on them.
+
+@test "a vhost cannot pick a different mode on the main server's cache" {
+    lapi_set '{}'
+    run apache_start "$(stream_conf)
+Crowdsec On
+NameVirtualHost *
+<VirtualHost *:$APACHE_PORT>
+    ServerName live.example
+    DocumentRoot \"$HARNESS_DIR/htdocs\"
+    Crowdsec On
+    CrowdsecMode live
+</VirtualHost>"
+    [ "$status" -ne 0 ]
+    grep -q "shares a CrowdsecCache with one in CrowdsecMode" \
+        "$HARNESS_DIR/logs/error.log"
+}
+
+@test "a vhost agreeing with the cache's mode still starts" {
+    lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip)],\"sticky\":true}"
+    apache_start "$(stream_conf)
+Crowdsec On
+NameVirtualHost *
+<VirtualHost *:$APACHE_PORT>
+    ServerName same.example
+    DocumentRoot \"$HARNESS_DIR/htdocs\"
+    Crowdsec On
+    CrowdsecMode stream
+</VirtualHost>"
+    wait_primed
+    run curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+        -H "Host: same.example" "http://127.0.0.1:$APACHE_PORT/"
+    [ "$output" = 429 ]
+}

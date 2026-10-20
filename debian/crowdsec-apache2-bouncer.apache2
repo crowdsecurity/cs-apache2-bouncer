@@ -1,3 +1,3 @@
 mod .libs/mod_crowdsec.so
-mod config/mod_crowdsec.load
-mod config/mod_crowdsec.conf
+mod config/crowdsec.load
+mod config/crowdsec.conf

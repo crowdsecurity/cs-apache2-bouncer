@@ -1,10 +1,18 @@
 #!/bin/sh
 
-set -eu
+# set -e only: dh_apache2's snippet below sources apache2-maintscript-helper on
+# purge, which in turn sources /etc/apache2/envvars, and envvars reads
+# APACHE_CONFDIR without checking it is set.
+set -e
 
 BOUNCER="crowdsec-apache2-bouncer"
 CONFIG="/etc/crowdsec/bouncers/$BOUNCER.conf"
 
+# Open-coded rather than calling delete_bouncer: by postrm time
+# /usr/lib/$BOUNCER/_bouncer.sh has already been removed. Done on purge and
+# not on remove, because a plain remove keeps the config file - deregistering
+# there would leave a retained config holding a key the API no longer knows,
+# and need_api_key would see a key set and never replace it.
 if [ "$1" = "purge" ]; then
     if [ -f "$CONFIG.id" ]; then
         bouncer_id=$(cat "$CONFIG.id")
@@ -12,3 +20,8 @@ if [ "$1" = "purge" ]; then
         rm -f "$CONFIG.id"
     fi
 fi
+
+# Also where dpkg-maintscript-helper's half of the mv_conffile rename lands.
+# It has to be called from preinst, postinst and postrm; without the token
+# here the old mods-available/mod_crowdsec.* files are never cleaned up.
+#DEBHELPER#

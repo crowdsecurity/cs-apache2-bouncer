@@ -1,2 +1,2 @@
-config/crowdsec-apache2-bouncer.conf etc/crowdsec/bouncers
-scripts/_bouncer.sh usr/lib/crowdsec-apache2-bouncer
+etc/crowdsec/bouncers
+usr/lib/crowdsec-apache2-bouncer

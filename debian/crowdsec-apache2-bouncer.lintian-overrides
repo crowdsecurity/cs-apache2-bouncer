@@ -1,0 +1,19 @@
+# Tag-only overrides on purpose: lintian 2.114 on jammy emits
+# "non-standard-file-perm <path> 0600 != 0644" while newer versions emit
+# "non-standard-file-perm 0600 != 0644 [<path>]", so an override carrying the
+# detail string matches on some releases and reports mismatched-override on
+# the others.
+
+# The package name is fixed by the crowdsec bouncer naming scheme, which the
+# install docs and the packagecloud repository layout both follow. It is not
+# going to become libapache2-mod-crowdsec.
+crowdsec-apache2-bouncer: non-standard-apache2-module-package-name
+
+# 0600 is the point. The config holds the local API key, and _bouncer.sh
+# rewrites that file with a shell redirect which preserves the mode it already
+# has rather than imposing one, so a 0644 config would stay 0644 with the key
+# in it. _bouncer.sh is 0600 and non-executable because it is sourced by the
+# maintainer scripts and is the code path that handles the key - same as every
+# other crowdsec bouncer.
+crowdsec-apache2-bouncer: non-standard-file-perm
+crowdsec-apache2-bouncer: script-not-executable

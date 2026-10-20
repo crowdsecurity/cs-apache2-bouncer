@@ -1,0 +1,4 @@
+config/crowdsec.load
+config/crowdsec.conf
+config/10-crowdsec.conf
+config/crowdsec-include.conf

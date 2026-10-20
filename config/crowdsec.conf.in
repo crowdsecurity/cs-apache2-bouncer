@@ -1,4 +1,4 @@
-# The module itself is loaded by mod_crowdsec.load, which a2enmod symlinks
+# The module itself is loaded by crowdsec.load, which a2enmod symlinks
 # alongside this file.
 
 # The shared cache holds decisions. It is required by CrowdsecMode stream and

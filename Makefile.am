@@ -44,7 +44,7 @@ EXTRA_DIST = $(CROWDSEC_SRC) $(CROWDSEC_HDRS) \
              fuzz/README.md \
              scripts/version.sh scripts/_bouncer.sh \
              config/crowdsec-apache2-bouncer.conf \
-             config/mod_crowdsec.load.in config/mod_crowdsec.conf.in \
+             config/crowdsec.load.in config/crowdsec.conf.in \
              config/10-crowdsec.conf.in config/crowdsec-include.conf.in
 
 @srcdir@/vendor/yyjson/yyjson.lo: @srcdir@/vendor/yyjson/yyjson.c \
@@ -85,7 +85,7 @@ install-bouncer-data:
 install-apache-snippets:
 if LAYOUT_DEBIAN
 	$(MKDIR_P) $(DESTDIR)@APACHE_CONFROOT@/mods-available
-	$(INSTALL_DATA) config/mod_crowdsec.load config/mod_crowdsec.conf \
+	$(INSTALL_DATA) config/crowdsec.load config/crowdsec.conf \
 	    $(DESTDIR)@APACHE_CONFROOT@/mods-available/
 endif
 if LAYOUT_EL

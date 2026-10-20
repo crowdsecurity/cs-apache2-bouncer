@@ -1,0 +1,8 @@
+# v0.1 shipped these as mod_crowdsec.{load,conf}. a2query strips a leading
+# "mod" from the name it is handed, so "mod_crowdsec" resolved to "_crowdsec"
+# and matched nothing: apache2_invoke could still enable the module (it falls
+# through to its "fresh install" branch) but dismod always reported "No action
+# required", so apt remove left apache with a LoadModule pointing at a deleted
+# .so. The a2enmod name has to be "crowdsec".
+mv_conffile /etc/apache2/mods-available/mod_crowdsec.load /etc/apache2/mods-available/crowdsec.load 1.0.0~
+mv_conffile /etc/apache2/mods-available/mod_crowdsec.conf /etc/apache2/mods-available/crowdsec.conf 1.0.0~

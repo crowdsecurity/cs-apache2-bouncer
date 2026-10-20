@@ -93,7 +93,7 @@ debian/crowdsec-apache2-bouncer/
 crowdsec_version.h
 # generated from the .in templates by configure; the module and apache paths
 # in them come from apxs
-/config/mod_crowdsec.load
-/config/mod_crowdsec.conf
+/config/crowdsec.load
+/config/crowdsec.conf
 /config/10-crowdsec.conf
 /config/crowdsec-include.conf

@@ -7,8 +7,8 @@ AC_INIT([crowdsec-apache2-bouncer], [1.0.0], [support@crowdsec.net],
         [https://github.com/crowdsecurity/cs-apache2-bouncer])
 AM_INIT_AUTOMAKE([dist-bzip2 subdir-objects])
 AC_CONFIG_FILES([Makefile crowdsec_version.h
-                 config/mod_crowdsec.load
-                 config/mod_crowdsec.conf
+                 config/crowdsec.load
+                 config/crowdsec.conf
                  config/10-crowdsec.conf
                  config/crowdsec-include.conf])
 AC_CONFIG_SRCDIR([mod_crowdsec.c])

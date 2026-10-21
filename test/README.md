@@ -39,7 +39,7 @@ Requires `apache2` plus, in `/usr/lib/apache2/modules`, `mod_mpm_prefork`,
 | `http-client.bats` | the libcurl layer: response ceiling, timeouts, closed port, handle reuse, `http_proxy` immunity |
 | `live-mode.bats` | per-request queries, the shared verdict cache, and every `CrowdsecFallback` value |
 | `stream-mode.bats` | background polling, ranges, deletion, expiry, the unprimed window |
-| `limits.bats` | cache too small, 100000 decisions, IPv6, many prefix lengths, malformed input, leader takeover |
+| `limits.bats` | cache too small, what the status figures report across pulls, 100000 decisions, IPv6, many prefix lengths, malformed input, leader takeover |
 | `appsec.bats` | what is forwarded for inspection, each verdict, failure handling |
 | `challenge.bats` | relaying the interstitial, cookies, headers, the internal endpoints, failing closed |
 | `appsec-body.bats` | body inspection and replay, the limit, drop vs bypass, chunked, gzip, LimitRequestBody |

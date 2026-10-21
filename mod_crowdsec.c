@@ -564,6 +564,13 @@ static int crowdsec_status_handler(request_rec *r)
         ap_rprintf(r, "pulls: %u\n", (unsigned int) st.pulls);
         ap_rprintf(r, "stored: %u\n", (unsigned int) st.stored);
         ap_rprintf(r, "retained: %u\n", (unsigned int) st.retained);
+        /* Without this the two figures above cannot be judged: they are from
+         * the last full pull, and how long ago that was depends on whether
+         * anything has asked for one.
+         */
+        ap_rprintf(r, "stored_age_s: %" APR_TIME_T_FMT "\n",
+                   st.stored_at ? apr_time_sec(apr_time_now() - st.stored_at)
+                   : -1);
         ap_rprintf(r, "last_pull_age_ms: %" APR_TIME_T_FMT "\n",
                    st.last_pull ? apr_time_as_msec(apr_time_now()
                                                    - st.last_pull) : -1);

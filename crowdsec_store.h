@@ -22,7 +22,36 @@ typedef struct
     apr_time_t last_run;
 } lease_t;
 
-/* Shared control state, about 90 bytes and fixed for the life of the server.
+/* How many written keys are tracked at once, and how often a full pull picks
+ * one up. A full pull writes six figures, so it samples sparsely and spreads
+ * the probes over the batch; a delta writes a handful, so every one of those
+ * is offered to whatever slot is free.
+ */
+#define CROWDSEC_SAMPLES_MAX 32
+#define CROWDSEC_SAMPLE_EVERY 100
+
+/* Keys this module has written, re-read after every pull to notice the cache
+ * quietly evicting them. Shared across pulls rather than gathered per pull,
+ * because a cache can fill up over hours of small deltas and a pull that
+ * writes twenty entries would never gather a sample of its own.
+ *
+ * expires is the decision's own deadline: an entry the socache has dropped
+ * because its decision ran out was not evicted, and without this every short
+ * decision would read as one.
+ *
+ * tracked and lost accumulate until the next full pull, so the ratio between
+ * them describes the snapshot in force rather than the most recent pull.
+ */
+typedef struct
+{
+    unsigned char key[CROWDSEC_SAMPLES_MAX][CROWDSEC_KEY_MAX];
+    unsigned char len[CROWDSEC_SAMPLES_MAX];    /* 0 for a free slot */
+    apr_time_t expires[CROWDSEC_SAMPLES_MAX];
+    apr_uint32_t tracked;
+    apr_uint32_t lost;
+} sample_set_t;
+
+/* Shared control state, about a kilobyte and fixed for the life of the server.
  * It gets its own region rather than a slot in the socache because losing any
  * of it is unrecoverable - no prefix bitmap means range decisions stop
  * matching, no primed flag means CrowdsecFallback decides every request - and
@@ -55,6 +84,7 @@ struct crowdsec_meta
     crowdsec_store_stats_t stats;
     plen_set_t plens4;
     plen_set_t plens6;
+    sample_set_t samples;
 };
 
 /* Every socache call needs the mutex: shmcb's retrieve mutates shared state

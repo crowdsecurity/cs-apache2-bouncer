@@ -41,6 +41,62 @@ Crowdsec On
 CONF
 }
 
+# A batch of <count> fresh single-ip bans numbered from <base>, replacing
+# whatever the stub was about to serve. Distinct from gen_decisions' 10.0.0.0/8
+# so a batch never re-stores an address the snapshot already carried.
+gen_batch() {
+    lapi_set "$(python3 - "$1" "$2" <<'PY'
+import json, sys
+base, n = int(sys.argv[1]), int(sys.argv[2])
+decs = [{"duration": "4h0m0s", "id": base + i, "origin": "cscli",
+         "scenario": "manual", "scope": "Ip", "type": "ban",
+         "value": "172.%d.%d.%d" % (16 + (((base + i) >> 16) & 15),
+                                    ((base + i) >> 8) & 255,
+                                    (base + i) & 255)}
+        for i in range(n)]
+print(json.dumps({"decisions": decs}))
+PY
+)"
+}
+
+# Waits until the stub has handed out the pending batch, so the next one does
+# not replace it unserved.
+wait_served() {
+    local i=0
+    while [ "$i" -lt 150 ]; do
+        if [ "$(lapi_get decisions)" = "[]" ]; then
+            return 0
+        fi
+        i=$((i + 1)); sleep 0.1
+    done
+    echo "a batch was never served" >&2
+    return 1
+}
+
+# Waits until the module reports <n> applied pulls.
+wait_pulls() {
+    local want="$1" i=0
+    while [ "$i" -lt 200 ]; do
+        if [ "$(status_field pulls)" -ge "$want" ]; then
+            return 0
+        fi
+        i=$((i + 1)); sleep 0.1
+    done
+    echo "only $(status_field pulls) pulls applied, wanted $want" >&2
+    return 1
+}
+
+# A stream-mode vhost that polls fast enough for a test to watch several pulls.
+polling_conf() {
+    cat <<CONF
+CrowdsecMode stream
+CrowdsecUpdateFrequency ${2:-1s}
+CrowdsecCache shmcb:limits($1)
+CrowdsecFallback allow
+Crowdsec On
+CONF
+}
+
 @test "a cache far too small reports eviction instead of failing quietly" {
     # 20000 decisions need about 1MB; 512KB cannot hold them
     gen_decisions 20000
@@ -83,6 +139,75 @@ CONF
     if [ "$status" -ne 0 ]; then
         skip "the client's own decision was evicted, as the log warns"
     fi
+}
+
+@test "the reported figures survive an incremental pull" {
+    # They used to be rewritten from every pull's own counter, so the first
+    # incremental pull that added nothing reported the cache as empty while it
+    # was holding the whole snapshot.
+    gen_decisions 1000
+    apache_start "$(polling_conf 4194304)"
+    wait_primed
+    stored="$(status_field stored)"
+    [ "$stored" -ge 1000 ]
+
+    # Nothing left to report, so the pulls that follow write nothing at all.
+    # Patched rather than replaced, to keep the counters the stub maintains.
+    lapi_patch sticky false
+    lapi_patch decisions '[]'
+    lapi_patch deleted '[]'
+    wait_pulls "$(( $(status_field pulls) + 2 ))"
+
+    [ "$(lapi_get startup_seen)" = 1 ]
+    [ "$(status_field stored)" = "$stored" ]
+    [ "$(status_field retained)" = "$stored" ]
+    [ "$(status_field stored_age_s)" -ge 0 ]
+}
+
+@test "an undersized cache is still reported as such between full pulls" {
+    # The figures are what the documented sizing check reads, so they have to
+    # stay readable on a server that has been up for a while - not only in the
+    # moment after the one full pull of its life.
+    gen_decisions 20000
+    apache_start "$(polling_conf 524288)"
+    wait_primed
+    stored="$(status_field stored)"
+    [ "$(status_field retained)" -lt "$stored" ]
+
+    lapi_patch sticky false
+    lapi_patch decisions '[]'
+    lapi_patch deleted '[]'
+    wait_pulls "$(( $(status_field pulls) + 2 ))"
+
+    [ "$(status_field stored)" = "$stored" ]
+    [ "$(status_field retained)" -lt "$stored" ]
+}
+
+@test "a cache filled by incremental pulls still reports eviction" {
+    # Every batch here is far below the sampling interval a full pull uses, so
+    # no pull has a sample of its own to check. Noticing the cache overflow at
+    # all means re-reading keys that earlier pulls wrote.
+    gen_decisions 200
+    apache_start "$(polling_conf 65536 200ms)"
+    wait_primed
+    stored="$(status_field stored)"
+
+    i=0
+    while [ "$i" -lt 40 ]; do
+        gen_batch "$(( i * 40 ))" 40
+        wait_served
+        if grep -q "decision cache is too small" \
+            "$HARNESS_DIR/logs/error.log"; then
+            break
+        fi
+        i=$(( i + 1 ))
+    done
+
+    grep -q "decision cache is too small" "$HARNESS_DIR/logs/error.log"
+    # and the status handler agrees with the log, which is what the README
+    # tells people to look at
+    [ "$(status_field stored)" = "$stored" ]
+    [ "$(status_field retained)" -lt "$stored" ]
 }
 
 @test "an ipv6 single address is blocked" {

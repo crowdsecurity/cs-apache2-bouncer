@@ -202,13 +202,6 @@ typedef struct
     unsigned int full:1;
     apr_uint16_t gen;           /* generation this batch writes */
     apr_uint32_t fresh_active[CROWDSEC_ORIGIN_MAX][CROWDSEC_IPT_MAX];
-    /* A sample of keys just written, re-read after the batch to notice the
-     * cache quietly evicting what we stored.
-     */
-    unsigned char sample[32][CROWDSEC_KEY_MAX];
-    apr_size_t sample_len[32];
-    apr_size_t samples;
-    apr_size_t sample_every;
 } apply_ctx_t;
 
 /* Releases and retakes the lock so request lookups can interleave with a
@@ -263,6 +256,62 @@ static int probe_existing(apply_ctx_t *a, const unsigned char *key,
     return 1;
 }
 
+/* The slot tracking this key, or -1. Caller holds the lock. */
+static int sample_slot(const sample_set_t *ss, const unsigned char *key,
+                       apr_size_t keylen)
+{
+    int i;
+
+    for (i = 0; i < CROWDSEC_SAMPLES_MAX; i++) {
+        if ((apr_size_t) ss->len[i] == keylen
+            && !memcmp(ss->key[i], key, keylen)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Starts tracking this key if a slot is free. A full set is left as it is: its
+ * keys are the oldest entries we wrote, and those are the ones shmcb
+ * force-expires first, so replacing them with newer ones would trade away the
+ * sensitivity this is here for.
+ */
+static void sample_note(apply_ctx_t *a, const unsigned char *key,
+                        apr_size_t keylen, apr_time_t expires)
+{
+    sample_set_t *ss = &a->sconf->meta->samples;
+    int slot = sample_slot(ss, key, keylen);
+    int i;
+
+    if (slot >= 0) {
+        ss->expires[slot] = expires;    /* re-stored, with a new duration */
+        return;
+    }
+    for (i = 0; i < CROWDSEC_SAMPLES_MAX; i++) {
+        if (!ss->len[i]) {
+            memcpy(ss->key[i], key, keylen);
+            ss->len[i] = (unsigned char) keylen;
+            ss->expires[i] = expires;
+            ss->tracked++;
+            return;
+        }
+    }
+}
+
+/* A decision the stream has withdrawn leaves the cache legitimately, so stop
+ * expecting to find it.
+ */
+static void sample_forget(apply_ctx_t *a, const unsigned char *key,
+                          apr_size_t keylen)
+{
+    sample_set_t *ss = &a->sconf->meta->samples;
+    int slot = sample_slot(ss, key, keylen);
+
+    if (slot >= 0) {
+        ss->len[slot] = 0;
+    }
+}
+
 static apr_status_t apply_one(void *ctx, int added,
                               const crowdsec_decision_t *d)
 {
@@ -270,6 +319,7 @@ static apr_status_t apply_one(void *ctx, int added,
     unsigned char key[CROWDSEC_KEY_MAX];
     apr_size_t keylen;
     decision_value_t val;
+    apr_time_t expires = apr_time_now() + d->duration;
     unsigned char oid, had_origin = CROWDSEC_ORIGIN_UNKNOWN;
     int ipt = net_ipt(&d->net);
     int had = 0;
@@ -305,6 +355,7 @@ static apr_status_t apply_one(void *ctx, int added,
         /* A removal for something we never had is not an error. */
         a->sconf->cache_provider->remove(a->sconf->cache_instance, a->s,
                                          key, (unsigned int) keylen, a->p);
+        sample_forget(a, key, keylen);
         if (had) {
             crowdsec_metrics_active_add(a->sconf, ipt, had_origin, -1);
         }
@@ -325,8 +376,7 @@ static apr_status_t apply_one(void *ctx, int added,
     gen_put(&val, a->gen);
 
     if (a->sconf->cache_provider->store(a->sconf->cache_instance, a->s,
-                                        key, (unsigned int) keylen,
-                                        apr_time_now() + d->duration,
+                                        key, (unsigned int) keylen, expires,
                                         (unsigned char *) &val, sizeof(val),
                                         a->p) != APR_SUCCESS) {
         a->store_failures++;
@@ -350,52 +400,87 @@ static apr_status_t apply_one(void *ctx, int added,
         crowdsec_metrics_active_add(a->sconf, ipt, oid, 1);
     }
 
-    if (a->sample_every && (a->stored % a->sample_every) == 0
-        && a->samples < 32) {
-        memcpy(a->sample[a->samples], key, keylen);
-        a->sample_len[a->samples] = keylen;
-        a->samples++;
+    /* A full pull writes six figures, so every hundredth is enough and leaves
+     * the probes spread over the start of the batch - the part the cache
+     * force-expires first. A delta writes too few entries for that to pick
+     * anything at all, so each of its own takes a slot if one is free.
+     */
+    if (!a->full || (a->stored % CROWDSEC_SAMPLE_EVERY) == 0) {
+        sample_note(a, key, keylen, expires);
     }
     return APR_SUCCESS;
 }
 
-/* Counts how many entries the cache can still hand back, and how many of our
- * sampled keys survived. shmcb force-expires the oldest entry in a subcache to
- * admit a new one and only logs it at debug level, so without this a cache
- * that is too small silently stops blocking people.
+/* Re-reads the tracked keys to see whether the cache still has what we wrote.
+ * shmcb force-expires the oldest entry in a subcache to admit a new one and
+ * only logs it at debug level, so without this a cache that is too small
+ * silently stops blocking people.
+ *
+ * Runs on every pull, not only on the full ones that publish st->stored:
+ * eviction can begin at any point, and a cache filled a few decisions at a
+ * time never has a pull large enough to notice it from its own batch.
  */
 static void check_retention(server_rec *s, apply_ctx_t *a,
                             crowdsec_store_stats_t *st)
 {
-    apr_size_t i, lost = 0;
+    sample_set_t *ss = &a->sconf->meta->samples;
+    apr_time_t now = apr_time_now();
+    apr_size_t lost_now = 0;
+    int i;
 
-    for (i = 0; i < a->samples; i++) {
+    for (i = 0; i < CROWDSEC_SAMPLES_MAX; i++) {
         decision_value_t val;
         unsigned int len = sizeof(val);
 
-        if (a->sconf->cache_provider->retrieve(a->sconf->cache_instance, s,
-                                               a->sample[i],
-                                               (unsigned int) a->sample_len[i],
-                                               (unsigned char *) &val, &len,
-                                               a->p) != APR_SUCCESS) {
-            lost++;
+        if (!ss->len[i]) {
+            continue;
         }
+        if (ss->expires[i] <= now) {
+            ss->len[i] = 0;     /* ran its course, which is not eviction */
+            continue;
+        }
+        if (a->sconf->cache_provider->retrieve(a->sconf->cache_instance, s,
+                                               ss->key[i],
+                                               (unsigned int) ss->len[i],
+                                               (unsigned char *) &val, &len,
+                                               a->p) == APR_SUCCESS) {
+            continue;
+        }
+        /* Freed so the slot can follow something that is still there. What was
+         * lost stays in the set's counters, which only reset on a full pull.
+         */
+        ss->len[i] = 0;
+        ss->lost++;
+        lost_now++;
     }
 
-    st->stored = (apr_uint32_t) a->stored;
-    st->retained = (apr_uint32_t) (a->stored
-                                   - (a->samples
-                                      ? (lost * a->stored) / a->samples
-                                      : 0));
+    if (a->full) {
+        /* A full pull has just rebuilt the store from a snapshot, so this is
+         * the population. An incremental one knows only how much its own batch
+         * added, which is not an answer to the question, so it leaves the
+         * figure - and the age reported next to it - alone.
+         */
+        st->stored = (apr_uint32_t) a->stored;
+        st->stored_at = now;
+    }
+    /* Scaled, because only CROWDSEC_SAMPLES_MAX keys are ever probed: the
+     * share of the tracked keys that went missing is taken as the share of the
+     * population that did.
+     */
+    st->retained = ss->tracked
+        ? (apr_uint32_t) (st->stored
+                          - (apr_uint64_t) ss->lost * st->stored / ss->tracked)
+        : st->stored;
 
-    if (lost) {
+    if (lost_now) {
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
                      "crowdsec: decision cache is too small: %"
-                     APR_SIZE_T_FMT " of %" APR_SIZE_T_FMT
-                     " sampled entries were already evicted after storing %"
-                     APR_SIZE_T_FMT ". Increase the CrowdsecCache size; "
-                     "decisions are being dropped and those clients are "
-                     "no longer blocked.", lost, a->samples, a->stored);
+                     APR_SIZE_T_FMT " tracked entries were dropped before "
+                     "their decisions expired, %u of %u since the last full "
+                     "pull. Increase the CrowdsecCache size; decisions are "
+                     "being dropped and those clients are no longer blocked.",
+                     lost_now, (unsigned int) ss->lost,
+                     (unsigned int) ss->tracked);
     }
     if (a->store_failures) {
         ap_log_error(APLOG_MARK, APLOG_ERR, 0, s,
@@ -444,8 +529,6 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
     a.p = ptemp;
     a.me = (apr_int64_t) getpid();
     a.full = full ? 1 : 0;
-    /* Sample roughly 1% of what we write, capped at 32 probes. */
-    a.sample_every = 100;
 
     rv = crowdsec_store_lock(sconf);
     if (rv != APR_SUCCESS) {
@@ -480,6 +563,10 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
     if (full) {
         a.gen = gen_take(sconf);
         sconf->meta->gen_applying = a.gen;
+        /* The tracked keys belong to the snapshot being replaced, so the
+         * eviction tally restarts with the one this pull is about to write.
+         */
+        memset(&sconf->meta->samples, 0, sizeof(sconf->meta->samples));
     }
     else {
         a.gen = sconf->meta->gen;

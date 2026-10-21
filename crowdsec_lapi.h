@@ -22,8 +22,16 @@ typedef struct
 {
     apr_time_t last_pull;
     apr_time_t primed_at;
-    apr_uint32_t stored;        /* entries the last full pull wrote */
-    apr_uint32_t retained;      /* how many of those survived, see overflow */
+    apr_time_t stored_at;       /* when stored was last measured */
+    /* What the last full pull wrote, and how much of it the cache still has.
+     * A full pull rebuilds the store from a snapshot, so it is the only kind
+     * that knows the population; an incremental one reports the size of its
+     * own batch, which says nothing about what is held, and so leaves stored
+     * alone. retained is re-estimated on every pull, because the cache can
+     * start evicting at any point.
+     */
+    apr_uint32_t stored;
+    apr_uint32_t retained;
     apr_uint32_t pulls;
     apr_uint32_t leader_changes;
 } crowdsec_store_stats_t;

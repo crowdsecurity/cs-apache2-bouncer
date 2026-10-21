@@ -154,13 +154,24 @@ real TCP peer instead.
 ```
 
 Reports `mode`, `url`, `cache`, the usage-metrics counters, and in stream mode
-`primed`, `pulls`, `stored`, `retained` and `last_pull_age_ms`.
+`primed`, `pulls`, `stored`, `retained`, `stored_age_s` and
+`last_pull_age_ms`.
 
-`stored` is what the last full pull wrote. `retained` estimates how many
-survived, extrapolated from a sample of up to 32 keys re-read after the pull,
-so treat it as an indicator rather than a count. `retained` below `stored`
-means the cache is evicting decisions and needs to be larger; the error log
-says so too.
+`stored` is what the last full pull wrote, and `stored_age_s` is how long ago
+that was. Incremental pulls leave both alone: the size of one batch of changes
+says nothing about what the cache is holding. Full pulls happen at startup,
+when the polling child changes, and once per usage-metrics reporting window -
+so with `CrowdsecMetrics Off` nothing asks for one and the figure stops moving
+after startup.
+
+`retained` estimates how much of that is still there, extrapolated from up to
+32 keys the module re-reads after every pull, so treat it as an indicator
+rather than a count. `retained` below `stored` means the cache is evicting
+decisions and needs to be larger; the error log says so too.
+
+For what the cache holds now rather than at the last snapshot, read the
+`active_decisions` counters in the metrics block: they move as decisions
+arrive and are withdrawn, and each full pull rebuilds them outright.
 
 The metrics block reports `metrics` (`on`/`off`), the reporting interval, the
 age of the current window and of the last push, the push and failure counts,

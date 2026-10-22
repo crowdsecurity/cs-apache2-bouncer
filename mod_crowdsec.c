@@ -24,43 +24,37 @@
 
 
 /*
- * The Apache mod_crowdsec module allows the request to be
- * verified against the blocklist supplied by Crowdsec at
- * https://www.crowdsec.net.
+ * The Apache mod_crowdsec module checks each request against the decisions
+ * published by CrowdSec at https://www.crowdsec.net.
  *
- * When blocked, this module returns 429 Too Many Requests
- * as described in
- * https://datatracker.ietf.org/doc/html/rfc6585#section-4
- *
- * Alternatively, the CrowdsecLocation directive can specify
- * an URL to redirect to on block.
+ * When blocked, this module returns 429 Too Many Requests, as described in
+ * https://datatracker.ietf.org/doc/html/rfc6585#section-4, or redirects to
+ * the URL given by CrowdsecLocation.
  *
  *  Author: Graham Leggett
+ *
+ * Decisions are obtained either per request (CrowdsecMode live) or from the
+ * decision stream, polled in the background and held in a shared cache
+ * (CrowdsecMode stream). Stream mode needs CrowdsecCache and keeps every
+ * decision locally, so it costs no round trip on the request path.
  *
  * Basic configuration:
  *
  * <IfModule !crowdsec_module>
  *   LoadModule crowdsec_module modules/mod_crowdsec.so
  * </IfModule>
- * <IfModule !proxy_module>
- *   LoadModule proxy_module modules/mod_proxy.so
- * </IfModule>
- * <IfModule !proxy_http_module>
- *   LoadModule proxy_http_module modules/mod_proxy_http.so
- * </IfModule>
  * <IfModule !socache_shmcb_module>
  *   LoadModule socache_shmcb_module modules/mod_socache_shmcb.so
  * </IfModule>
  *
- * <Proxy "http://localhost:8080">
- *   ProxySet connectiontimeout=1 timeout=5
- * </Proxy>
- *
  * CrowdsecURL http://localhost:8080
  * CrowdsecAPIKey [...]
  *
- * CrowdsecCache shmcb
- * CrowdsecCacheTimeout 60
+ * # stream mode wants room for every decision; see the directive docs for
+ * # how to size this
+ * CrowdsecCache shmcb:crowdsec(16777216)
+ * CrowdsecMode stream
+ * CrowdsecUpdateFrequency 10s
  *
  * <Location />
  *   Crowdsec on
@@ -71,930 +65,817 @@
  *   ErrorDocument 429 "IP Address Blocked"
  * </Location>
  *
- * <Location /two/>
- *   Crowdsec on
- *   ErrorDocument 429 https://somewhere.example.com/blocked.html
- * </Location>
- *
- * <Location /three/>
- *   Crowdsec on
- *   ErrorDocument 429 /you-are-blocked.html
- * </Location>
- *
  * <Location /four/>
  *   Crowdsec on
  *   CrowdsecLocation https://somewhere.example.com/blocked.html?ip=%{REMOTE_ADDR}
  * </Location>
  */
 
-#include "httpd.h"
-#include "http_config.h"
-#include "http_log.h"
+#include "crowdsec_config.h"
+
 #include "http_core.h"
+#include "http_log.h"
 #include "http_protocol.h"
 #include "http_request.h"
-#include "ap_expr.h"
-#include "ap_socache.h"
-#include "util_mutex.h"
+#include "ap_mpm.h"
 
-#include <apr_strings.h>
+#include "apr_strings.h"
 
-module AP_MODULE_DECLARE_DATA crowdsec_module;
+#include "crowdsec_appsec.h"
+#include "crowdsec_http.h"
+#include "crowdsec_lapi.h"
+#include "crowdsec_metrics.h"
+#include "crowdsec_util.h"
 
-typedef struct
-{
-    /* the url of the crowdsec service */
-    const char *url;
-    /* the API key of the crowdsec service */
-    const char *key;
-    /* shared obect cache mutex */
-    apr_global_mutex_t *cache_mutex;
-    /* The configured shared object cache provider */
-    const ap_socache_provider_t *cache_provider;
-    /* shared object cache provider data structure */
-    ap_socache_instance_t *cache_instance;
-    /* shared object cache timeout */
-    apr_interval_time_t cache_timeout;
-    /* the url was explicitly set */
-    unsigned int url_set:1;
-    /* the key was explicitly set */
-    unsigned int key_set:1;
-    /* the provider was explicitly set */
-    unsigned int cache_provider_set:1;
-    /* the timeout was explicitly set */
-    unsigned int cache_timeout_set:1;
-} crowdsec_server_rec;
-
-typedef enum {
-    CROWDSEC_FAIL,
-    CROWDSEC_BLOCK,
-    CROWDSEC_ALLOW
-} crowdsec_fallback;
-
-typedef enum {
-    TOO_MANY_REQS = HTTP_TOO_MANY_REQUESTS,
-    FORBIDDEN = HTTP_FORBIDDEN,
-    INT_ERROR = HTTP_INTERNAL_SERVER_ERROR,
-} http_code;
-
-typedef struct
-{
-    /* the response from the crowdsec service is stored here */
-    const char *response;
-    /* the location to redirect to on block */
-    ap_expr_info_t *location;
-    /* enable was explicitly set */
-    unsigned int enable:1;
-    /* crowdsec fallback behaviour */
-    crowdsec_fallback fallback:2;
-    /* crowdsec blocked http code */
-    http_code blockedhttpcode;
-    /* crowdsec has been enabled */
-    unsigned int enable_set:1;
-    /* enable was explicitly set */
-    unsigned int fallback_set:1;
-    /* location was explicitly set */
-    unsigned int location_set:1;
-    /* blocked http code was explicitely set */
-    unsigned int blockedhttpcode_set:1;
-} crowdsec_config_rec;
-
-#define CROWDSEC_CACHE_TIMEOUT_DEFAULT 60
-
-#define MAX_VAL_LEN 256
+/* must be last: see the file for why */
+#include "crowdsec_poison.h"
 
 static const char *const crowdsec_id = "crowdsec";
 
 static apr_status_t cleanup_lock(void *data)
 {
     server_rec *s = data;
+    crowdsec_server_rec *sconf = ap_get_module_config(s->module_config,
+                                                      &crowdsec_module);
 
-    crowdsec_server_rec *sconf = (crowdsec_server_rec *)
-        ap_get_module_config(s->module_config,
-                             &crowdsec_module);
     if (sconf->cache_mutex) {
         apr_global_mutex_destroy(sconf->cache_mutex);
         sconf->cache_mutex = NULL;
     }
-
     return APR_SUCCESS;
 }
 
 static apr_status_t cleanup_cache(void *data)
 {
     server_rec *s = data;
-
-    crowdsec_server_rec *sconf = (crowdsec_server_rec *)
-        ap_get_module_config(s->module_config,
-                             &crowdsec_module);
+    crowdsec_server_rec *sconf = ap_get_module_config(s->module_config,
+                                                      &crowdsec_module);
 
     if (sconf->cache_instance) {
         sconf->cache_provider->destroy(sconf->cache_instance, s);
         sconf->cache_instance = NULL;
     }
-
     return APR_SUCCESS;
 }
 
-/*
- * The socache_shmcb module has an arbitrary restriction
- * that keys cannot be less than 4 bytes. Localhost can
- * be 3 bytes (::1), pad if necessary.
- */
-static const char *crowdsec_cache_key(request_rec * r, apr_size_t * len)
+int crowdsec_blocked_code(crowdsec_config_rec *conf)
 {
-
-    const char *key = r->useragent_ip;
-
-    apr_size_t slen = strlen(key);
-
-    if (slen < 4) {
-
-        char *padded;
-
-        padded = apr_pcalloc(r->pool, 5);
-        memset(padded, ' ', 4);
-        memcpy(padded, r->useragent_ip, slen);
-
-        *len = 4;
-        return padded;
-    }
-    else {
-        *len = slen;
-        return key;
-    }
-}
-
-static const char *crowdsec_from_cache(request_rec * r)
-{
-
-    const char *key;
-    apr_size_t keylen;
-
-    unsigned char val[MAX_VAL_LEN];
-    unsigned int vallen = MAX_VAL_LEN - 1;
-
-    crowdsec_server_rec *sconf = (crowdsec_server_rec *)
-        ap_get_module_config(r->server->module_config,
-                             &crowdsec_module);
-
-    const char *response = NULL;
-
-    apr_status_t status;
-
-    if (!sconf->cache_provider) {
-        return NULL;
-    }
-
-    key = crowdsec_cache_key(r, &keylen);
-
-    status = sconf->cache_provider->retrieve(sconf->cache_instance, r->server,
-                                             (unsigned char *) key, keylen,
-                                             val, &vallen, r->pool);
-
-    if (APR_STATUS_IS_NOTFOUND(status)) {
-        /* not found - just return */
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                      "crowdsec: no response found in cache for %s",
-                      r->useragent_ip);
-        return NULL;
-    }
-    else if (status == APR_SUCCESS) {
-        /* OK, we got a value */
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                      "crowdsec: response found in cache for %s",
-                      r->useragent_ip);
-    }
-    else {
-        /* error: give up and pass the buck */
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r,
-                      "crowdsec: error while retrieving cache response for %s",
-                      r->useragent_ip);
-        return NULL;
-    }
-
-    response = apr_pstrmemdup(r->pool, (char *) val, vallen);
-
-    return response;
-}
-
-static void crowdsec_to_cache(request_rec * r, const char *response)
-{
-
-    crowdsec_server_rec *sconf = (crowdsec_server_rec *)
-        ap_get_module_config(r->server->module_config,
-                             &crowdsec_module);
-
-    apr_time_t expiry;
-
-    const char *key;
-    apr_size_t keylen;
-
-    apr_status_t status;
-
-    if (!sconf->cache_mutex) {
-        return;
-    }
-
-    status = apr_global_mutex_trylock(sconf->cache_mutex);
-
-    if (APR_STATUS_IS_EBUSY(status)) {
-        /* don't wait around; just abandon it */
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, status, r,
-                      "crowdsec: result for %s not written to cache (mutex busy)",
-                      r->useragent_ip);
-        return;
-    }
-    else if (status != APR_SUCCESS) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r,
-                      "crowdsec: result for %s not written to cache (failed to lock cache mutex)",
-                      r->useragent_ip);
-        return;
-    }
-
-
-    key = crowdsec_cache_key(r, &keylen);
-
-    expiry = apr_time_now() + sconf->cache_timeout;
-
-    /* store it */
-    status = sconf->cache_provider->store(sconf->cache_instance, r->server,
-                                          (unsigned char *) key, keylen,
-                                          expiry, (unsigned char *) response,
-                                          strlen(response), r->pool);
-
-    if (status == APR_SUCCESS) {
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-                      "crowdsec: result for %s written to cache", r->useragent_ip);
-    }
-    else {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r,
-                      "crowdsec: result for %s not written to cache",
-                      r->useragent_ip);
-    }
-
-    /* We're done with the mutex */
-    status = apr_global_mutex_unlock(sconf->cache_mutex);
-
-    if (status != APR_SUCCESS) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r,
-                      "crowdsec: failed to release mutex");
-    }
-
-}
-
-static int crowdsec_proxy(request_rec * r, const char **response)
-{
-
-    request_rec *rr;
-    int status;
-
-    crowdsec_server_rec *sconf = (crowdsec_server_rec *)
-        ap_get_module_config(r->server->module_config,
-                             &crowdsec_module);
-
-    crowdsec_config_rec *rrconf;
-
-    /*
-     * Using mod_proxy, we connect to the crowdsec API.
-     *
-     * To do this, we create a subrequest, and then disassociate
-     * the subrequest from the main request so that no part of
-     * the crowdsec response ends up in the main response.
-     *
-     * We then replace the input filter stack with a null filter
-     * so that no attempt is made to read from the main request,
-     * and finally we replace the output filter stack with a
-     * filter that reads and parses the response from the API.
+    /* Resolved here rather than seeded in the config creator, so that an unset
+     * parent scope is not mistaken for one that chose a value explicitly. The
+     * default cannot be left as the struct's zero: OK == 0 in Apache, which
+     * check_access reads as DECLINED and lets a banned request through.
      */
-
-    const char *target = apr_pstrcat(r->pool, sconf->url,
-                                     "/v1/decisions?ip=",
-                                     ap_escape_urlencoded(r->pool,
-                                                          r->useragent_ip),
-                                     NULL);
-
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r,
-                  "crowdsec: looking up IP '%s' at url: %s",
-                  r->useragent_ip, target);
-
-    /* create a proxy request */
-    rr = ap_sub_req_method_uri("GET", r->uri, r, NULL);
-
-    if (rr->status != HTTP_OK) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
-                      "crowdsec: service '%s' returned %d, request rejected: %s",
-                      target, rr->status, r->uri);
-        return rr->status;
-    }
-
-    /* disassociate the subrequest from the main request */
-    rr->main = NULL;
-    rr->output_filters = NULL;
-    ap_add_output_filter("CROWDSEC", NULL, rr, r->connection);
-
-    /* Make sure that proxy cannot touch our main request body */
-    rr->input_filters = NULL;
-    ap_add_input_filter("CROWDSEC_NULL", NULL, rr, r->connection);
-
-    /* headers and trailers */
-    rr->headers_in = apr_table_make(r->pool, 2);
-    rr->trailers_in = apr_table_make(r->pool, 2);
-    rr->headers_out = apr_table_make(r->pool, 2);
-    rr->trailers_out = apr_table_make(r->pool, 2);
-
-    /* emulate the function of proxy_detect so that a remote proxy request
-     * will be attempted */
-    rr->proxyreq = PROXYREQ_REVERSE;
-    rr->uri = rr->unparsed_uri;
-    rr->filename = apr_pstrcat(rr->pool, "proxy:", target, NULL);
-    rr->handler = "proxy-server";
-
-    /* make sure we don't recurse */
-    rrconf = (crowdsec_config_rec *)
-        ap_get_module_config(rr->per_dir_config, &crowdsec_module);
-
-    if (sconf->key) {
-        apr_table_setn(rr->headers_in, "X-Api-Key", sconf->key);
-    }
-
-    apr_table_setn(rr->headers_in, "User-Agent", ap_get_server_description());
-
-    status = ap_run_sub_req(rr);
-
-    if (HTTP_NOT_FOUND == status) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
-                      "crowdsec: we received a 404 Not Found when speaking "
-                      "to the crowdsec service '%s', you might be pointing at "
-                      "something that isn't a crowdsec service, or the "
-                      "mod_proxy_http module has not been installed, request "
-                      "rejected: %s", target, r->uri);
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    else if ((status)) {
-
-        crowdsec_config_rec *conf = (crowdsec_config_rec *)
-            ap_get_module_config(r->per_dir_config,
-                                 &crowdsec_module);
-
-        switch (conf->fallback) {
-        case CROWDSEC_FAIL: {
-
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
-                          "crowdsec: crowdsec service '%s' returned status %d, "
-                          "request failed: %s", target, status, r->uri);
-
-            apr_table_setn(r->notes, "error-notes",
-                           "Could not verify the request against the threat intelligence "
-                           "service, the request has been rejected.");
-
-            /* Allow "error-notes" string to be printed by ap_send_error_response() */
-            apr_table_setn(r->notes, "verbose-error-to", "*");
-
-            return HTTP_INTERNAL_SERVER_ERROR;
-        }
-        case CROWDSEC_BLOCK: {
-
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
-                          "crowdsec: crowdsec service '%s' returned status %d, "
-                          "request blocked: %s", target, status, r->uri);
-
-            *response = apr_psprintf(r->pool,
-                                     "[{\"error\":\"'%s' returned %d\"}]",
-                                     target, status);
-
-            return OK;
-        }
-        case CROWDSEC_ALLOW: {
-
-            ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
-                          "crowdsec: crowdsec service '%s' returned status %d, "
-                          "request accepted anyway: %s", target, status, r->uri);
-
-            *response = "null";
-
-            return OK;
-        }
-        }
-
-    }
-
-    if (!rrconf->response) {
-        ap_log_rerror(APLOG_MARK, APLOG_ERR, APR_SUCCESS, r,
-                      "crowdsec: response from crowdsec service '%s' was not recorded, "
-                      "request rejected: %s", target, r->uri);
-        return HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    *response = rrconf->response;
-
-    return OK;
+    return conf->blockedhttpcode_set ? conf->blockedhttpcode
+        : HTTP_TOO_MANY_REQUESTS;
 }
 
-static int crowdsec_query(request_rec * r)
+const char *crowdsec_client_ip(request_rec *r, crowdsec_config_rec *conf)
 {
+    /* useragent_ip is what mod_remoteip rewrites from RemoteIPHeader. That is
+     * correct behind a trusted proxy and a liability without one, so an
+     * operator who cannot fix the proxy configuration can pin us to the real
+     * peer instead.
+     */
+    if (conf->trust_useragent_ip_set && !conf->trust_useragent_ip) {
+        return r->connection->client_ip;
+    }
+    return r->useragent_ip;
+}
 
-    const char *response;
-    int status;
+/* Which family label this client address gets. A v6 literal always carries a
+ * colon and a v4 one never does, which is the same split crowdsec_cidr_parse
+ * makes - so the metric label agrees with how the store keyed the address,
+ * including for the v4-mapped form some proxies produce.
+ */
+static int client_ipt(const char *ip)
+{
+    return ap_strchr_c(ip, ':') ? CROWDSEC_IPT_V6 : CROWDSEC_IPT_V4;
+}
 
-    crowdsec_server_rec *sconf = (crowdsec_server_rec *)
-        ap_get_module_config(r->server->module_config,
-                             &crowdsec_module);
+/* ------------------------------------------------------------ the decision */
 
-    crowdsec_config_rec *conf = (crowdsec_config_rec *)
-        ap_get_module_config(r->per_dir_config,
-                             &crowdsec_module);
+static int crowdsec_apply(request_rec *r, crowdsec_config_rec *conf,
+                          crowdsec_rem_t rem, const char *ip)
+{
+    int code;
 
-    if (r->main || !sconf || !sconf->url) {
+    if (rem == CROWDSEC_REM_UNKNOWN || rem == CROWDSEC_REM_CAPTCHA) {
+        /* This module serves no captcha, and an action invented by an
+         * administrator means nothing to us. Either is resolved by
+         * CrowdsecRemediationFallback, which defaults to ban so that an
+         * unservable remediation is never silently downgraded to allow.
+         */
+        rem = conf->remediation_fallback_set ? conf->remediation_fallback
+            : CROWDSEC_REM_BAN;
+    }
+    if (rem < CROWDSEC_REM_BAN) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r,
+                      "crowdsec: ip address '%s' not blocked, request "
+                      "accepted: %s", ip, r->uri);
+        apr_table_setn(r->subprocess_env, "CROWDSEC_STATUS", "allow");
         return DECLINED;
     }
 
-    response = crowdsec_from_cache(r);
+    code = crowdsec_blocked_code(conf);
+    apr_table_setn(r->subprocess_env, "CROWDSEC_STATUS", "ban");
 
-    if (!response) {
+    if (conf->location) {
+        const char *location, *err = NULL;
 
-        status = crowdsec_proxy(r, &response);
-
-        if ((status) != OK) {
-            return status;
-        }
-
-        crowdsec_to_cache(r, response);
-
-    }
-
-    /* parse response of crowdsec request here */
-
-    if (!strcmp("null", response)) {
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r,
-                      "crowdsec: ip address '%s' not blocked, "
-                      "request accepted: %s", r->useragent_ip, r->uri);
-        return OK;
-    }
-
-    else if (conf->location) {
-
-        const char *location;
-        const char *err;
-
-        err = NULL;
         location = ap_expr_str_exec(r, conf->location, &err);
         if (err) {
-            ap_log_rerror(
-                    APLOG_MARK, APLOG_ERR, 0, r,
-                                       "crowdsec: CrowdsecLocation: can't "
-                    "evaluate location expression: %s", err);
+            ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                          "crowdsec: CrowdsecLocation: can't evaluate "
+                          "location expression: %s", err);
             return HTTP_INTERNAL_SERVER_ERROR;
         }
-
         ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r,
-                      "crowdsec: ip address '%s' lookup returned %s, "
-                      "request redirected to '%s': %s",
-                      r->useragent_ip, response, location, r->uri);
-
-        ap_custom_response(r, conf->blockedhttpcode, location);
-        return conf->blockedhttpcode;
+                      "crowdsec: ip address '%s' blocked, request redirected "
+                      "to '%s': %s", ip, location, r->uri);
+        ap_custom_response(r, code, location);
+        return code;
     }
 
-    else {
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r,
-                      "crowdsec: ip address '%s' lookup returned %s, "
-                      "request rejected: %s",
-                      r->useragent_ip, response, r->uri);
-        return conf->blockedhttpcode;
-    }
-
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, r,
+                  "crowdsec: ip address '%s' blocked, request rejected: %s",
+                  ip, r->uri);
+    return code;
 }
 
-static int crowdsec_check_access(request_rec * r)
+static int crowdsec_fallback(request_rec *r, crowdsec_config_rec *conf,
+                             const char *why)
 {
-    /* make sure we don't recurse */
-    crowdsec_config_rec *conf = (crowdsec_config_rec *)
-        ap_get_module_config(r->per_dir_config,
-                             &crowdsec_module);
+    crowdsec_fallback_t fb = conf->fallback;
 
-    int status;
+    apr_table_setn(r->subprocess_env, "CROWDSEC_STATUS", why);
 
-    if (r->main || !conf->enable) {
+    switch (fb) {
+    case CROWDSEC_ALLOW:
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "crowdsec: %s; allowing the request (CrowdsecFallback "
+                      "allow)", why);
         return DECLINED;
+    case CROWDSEC_BLOCK:
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "crowdsec: %s; blocking the request (CrowdsecFallback "
+                      "block)", why);
+        return crowdsec_apply(r, conf, CROWDSEC_REM_BAN,
+                              crowdsec_client_ip(r, conf));
+    case CROWDSEC_FAIL:
+    default:
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "crowdsec: %s; failing the request (CrowdsecFallback "
+                      "fail)", why);
+        apr_table_setn(r->notes, "error-notes",
+                       "Could not verify the request against the threat "
+                       "intelligence service, the request has been rejected.");
+        apr_table_setn(r->notes, "verbose-error-to", "*");
+        return HTTP_INTERNAL_SERVER_ERROR;
     }
-
-    if ((status = crowdsec_query(r)) == OK) {
-        return DECLINED;
-    }
-
-    return status;
 }
 
-/**
- * CROWDSEC filter: Soak up the response from the API.
- *
- * Set the response aside to be accessible to the
- * crowdsec_query above.
+/* Set on every request_rec where this module actually reached a verdict.
+ * r->notes is per-request_rec - an internal redirect gets a fresh table - so
+ * walking r->prev distinguishes "already checked" from "never checked".
  */
-static apr_status_t crowdsec_out_filter(ap_filter_t * f,
-                                        apr_bucket_brigade * bb)
+#define CROWDSEC_NOTE_DECIDED "crowdsec-decided"
+
+static int decided_earlier(request_rec *r)
 {
+    request_rec *prev;
 
-    crowdsec_config_rec *conf = (crowdsec_config_rec *)
-        ap_get_module_config(f->r->per_dir_config,
-                             &crowdsec_module);
-    char *response;
+    for (prev = r->prev; prev; prev = prev->prev) {
+        if (apr_table_get(prev->notes, CROWDSEC_NOTE_DECIDED)) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
-    apr_off_t len;
-    apr_size_t size;
+/* Resolved at the point of use, so an unset parent scope is not mistaken for
+ * one that chose the default explicitly.
+ */
+static crowdsec_rem_t remediation_fallback(crowdsec_config_rec *conf)
+{
+    return conf->remediation_fallback_set ? conf->remediation_fallback
+        : CROWDSEC_REM_BAN;
+}
 
-    apr_brigade_length(bb, 1, &len);
-    size = (apr_size_t) len;
-    response = apr_palloc(f->r->pool, size + 1);
-    apr_brigade_flatten(bb, response, &size);
-    response[len] = 0;
+static int appsec_failure(request_rec *r, crowdsec_config_rec *conf,
+                          crowdsec_rem_t *rem)
+{
+    if (conf->appsec_failure_action_set
+        && conf->appsec_failure_action == CROWDSEC_APPSEC_DENY) {
+        *rem = crowdsec_rem_merge(*rem, CROWDSEC_REM_BAN);
+        return 1;
+    }
+    /* Fail open. This is an availability choice, not a security one: an
+     * attacker who can degrade the engine buys themselves a window with no
+     * inspection, which is what CrowdsecAppsecFailureAction deny is for.
+     */
+    return 0;
+}
 
-    conf->response = response;
+static int crowdsec_check_access(request_rec *r)
+{
+    crowdsec_config_rec *conf = ap_get_module_config(r->per_dir_config,
+                                                     &crowdsec_module);
+    crowdsec_server_rec *sconf = ap_get_module_config(r->server->module_config,
+                                                      &crowdsec_module);
+    crowdsec_req_rec *st;
+    crowdsec_rem_t rem = CROWDSEC_REM_ALLOW;
+    crowdsec_rem_t lapi_rem = CROWDSEC_REM_ALLOW;
+    crowdsec_lookup_t lr;
+    const char *ip;
+    unsigned char origin = CROWDSEC_ORIGIN_UNKNOWN;
+    int appsec_on, challenge_path = 0, ipt;
 
-    apr_brigade_cleanup(bb);
+    /* A subrequest is covered by the main request. */
+    if (r->main) {
+        return DECLINED;
+    }
+    /* An internal redirect inherits a verdict only if one was actually
+     * reached. A RewriteRule out of an unprotected scope into a protected one
+     * arrives here with r->prev set and nothing checked, so declining on
+     * r->prev alone would hand the target over unchecked. An ErrorDocument
+     * follows a request we did decide, so it still short-circuits here.
+     *
+     * The body is gone by this point, though: the original request consumed
+     * it. A redirect that does reach the checks below therefore inspects
+     * headers only - see the body handling in crowdsec_appsec_check.
+     */
+    if (r->prev && decided_earlier(r)) {
+        /* The verdict carries over, but the body does not: the redirect lost
+         * our input filter and HTTP_IN is already drained, so hand the
+         * captured copy to this request's handler.
+         */
+        crowdsec_appsec_inherit_body(r);
+        return DECLINED;
+    }
+    if (!sconf) {
+        return DECLINED;
+    }
+    /* A forward-proxy request is a different threat model and r->unparsed_uri
+     * means something else there. Reverse-proxied requests are deliberately
+     * NOT excluded: ProxyPass sets PROXYREQ_REVERSE from translate_name, which
+     * runs before this hook, so skipping them would leave every Apache acting
+     * as a reverse proxy - a primary deployment for this module - with no
+     * decision lookup at all.
+     *
+     * Keyed on proxyreq alone, not on M_CONNECT: with ProxyRequests off a
+     * CONNECT is not a proxy request - Apache leaves proxyreq as
+     * PROXYREQ_NONE and resolves the target against the document root - so
+     * declining on the method let a banned client swap GET for CONNECT and be
+     * served local content with no lookup and no inspection.
+     */
+    if (r->proxyreq == PROXYREQ_PROXY) {
+        return DECLINED;
+    }
 
+    appsec_on = conf->appsec_enable_set && conf->appsec_enable;
+
+    /* The challenge's own assets and its submit endpoint live outside whatever
+     * <Location> enabled appsec, so without this the engine would never be
+     * consulted for them, the origin would 404, and a challenged visitor would
+     * be stuck for good - not blocked, not allowed. This is the one place the
+     * module deliberately overrides a per-directory off, and the whole prefix
+     * is reserved for it.
+     *
+     * Matched on r->uri, which Apache has already decoded and collapsed, so a
+     * traversal cannot slip past; the engine is still sent r->unparsed_uri,
+     * because it routes on that and its rules need the raw form.
+     */
+    if (sconf->appsec_url
+        && crowdsec_is_challenge_path(r->uri,
+                                      sconf->appsec_internal_path
+                                      ? sconf->appsec_internal_path
+                                      : CROWDSEC_APPSEC_INTERNAL_DEFAULT)) {
+        appsec_on = 1;
+        challenge_path = 1;
+    }
+
+    if (!conf->enable && !appsec_on) {
+        return DECLINED;
+    }
+    if (appsec_on && !sconf->appsec_url) {
+        appsec_on = 0;
+    }
+
+    /* Past the enable gate, so this request really is being decided - by the
+     * local API, by AppSec, or by the fallback below. Marking any earlier
+     * would let a "Crowdsec off" scope claim a verdict it never reached, and
+     * an internal redirect out of it would inherit that and skip its own
+     * check.
+     */
+    apr_table_setn(r->notes, CROWDSEC_NOTE_DECIDED, "1");
+
+    ip = crowdsec_client_ip(r, conf);
+    if (!ip) {
+        return crowdsec_fallback(r, conf, "no client address");
+    }
+    ipt = client_ipt(ip);
+
+    /* Counted here, where the request is certainly being decided, and counted
+     * once: subrequests and internal redirects that inherit a verdict have
+     * already returned above, and a scope with nothing enabled never gets
+     * this far.
+     */
+    crowdsec_metrics_processed(sconf, ipt);
+
+    st = apr_pcalloc(r->pool, sizeof(*st));
+    st->r = r;
+    ap_set_module_config(r->request_config, &crowdsec_module, st);
+
+    /* 1. The local API's view, from the stream cache or a live query. */
+    if (conf->enable && sconf->url) {
+        lr = crowdsec_lapi_lookup(r, sconf, ip, &rem, &origin);
+        lapi_rem = rem;
+        if (lr != CROWDSEC_LOOKUP_OK) {
+            int fb = crowdsec_fallback(r, conf,
+                                       lr == CROWDSEC_LOOKUP_UNPRIMED
+                                       ? "the decision stream has not been "
+                                         "loaded yet"
+                                       : "could not query crowdsec");
+
+            /* Only an allow fallback carries on. Returning here whenever the
+             * local API was unreachable would also switch off a perfectly
+             * healthy AppSec - and CROWDSEC_LOOKUP_UNPRIMED happens on every
+             * start in stream mode, so inspection would be off for the first
+             * seconds after each restart. It would also let the challenge
+             * endpoints fall through to the origin, which is the
+             * permanently-stuck case the carve-out exists to prevent.
+             */
+            if (fb != DECLINED) {
+                return fb;
+            }
+            /* rem stays ALLOW; whatever AppSec says below decides. */
+        }
+    }
+
+    /* 2. Inspection, unless the verdict is already as restrictive as it can
+     * get. Nothing is gained by inspecting a request that is already banned.
+     */
+    if (appsec_on
+        && (rem < CROWDSEC_REM_BAN
+            || (conf->appsec_always_send_set && conf->appsec_always_send))) {
+        switch (crowdsec_appsec_check(r, sconf, conf, st, ip)) {
+        case CROWDSEC_APPSEC_OK:
+            rem = crowdsec_rem_merge(rem,
+                                     crowdsec_action_to_rem(st->verdict.action
+                                                            ? st->verdict.action
+                                                            : ""));
+            /* A parse failure on a 403 sets the remediation directly. */
+            if (st->verdict.rem > rem) {
+                rem = st->verdict.rem;
+            }
+            break;
+        case CROWDSEC_APPSEC_DROP:
+            rem = crowdsec_rem_merge(rem, CROWDSEC_REM_BAN);
+            break;
+        case CROWDSEC_APPSEC_BADREQ:
+            /* A body read that failed already knows why: 413 for
+             * LimitRequestBody, 408 on a read timeout, 501 for an
+             * unimplemented transfer encoding. AP_FILTER_ERROR means a filter
+             * has already produced the response, so pass it straight through.
+             * Flattening all of these to 400 is what the comment on
+             * capture_body claimed was not happening.
+             */
+            if (st->read_rv != APR_SUCCESS) {
+                if (st->read_rv == AP_FILTER_ERROR) {
+                    return AP_FILTER_ERROR;
+                }
+                return ap_map_http_request_error(st->read_rv,
+                                                 HTTP_BAD_REQUEST);
+            }
+            return HTTP_BAD_REQUEST;
+        case CROWDSEC_APPSEC_FAIL:
+        default:
+            appsec_failure(r, conf, &rem);
+            break;
+        }
+    }
+
+    /* Whatever the inspection added is the WAF's call, not a decision's, so it
+     * is reported under its own origin - the same split the haproxy bouncer
+     * makes. Without this the WAF looks idle in the Console however much it is
+     * blocking.
+     */
+    if (rem > lapi_rem) {
+        origin = CROWDSEC_ORIGIN_APPSEC;
+    }
+
+    if (rem == CROWDSEC_REM_UNKNOWN || rem == CROWDSEC_REM_CAPTCHA) {
+        if (rem == CROWDSEC_REM_CAPTCHA) {
+            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                          "crowdsec: a captcha was requested for '%s' but "
+                          "this component cannot serve one; applying "
+                          "CrowdsecRemediationFallback", ip);
+        }
+        else {
+            ap_log_rerror(APLOG_MARK, APLOG_INFO, 0, r,
+                          "crowdsec: unrecognised remediation '%s' for '%s'; "
+                          "applying CrowdsecRemediationFallback",
+                          st->verdict.action ? st->verdict.action : "?", ip);
+        }
+        rem = remediation_fallback(conf);
+    }
+
+    if (rem == CROWDSEC_REM_CHALLENGE) {
+        int rv;
+
+        /* Only the engine can produce a challenge, because only it has the
+         * page and the sealed cookie. A challenge arriving any other way - a
+         * blocklist, or a local decision - has no body to serve, so it has to
+         * fail closed.
+         */
+        rv = crowdsec_appsec_serve(r, &st->verdict);
+        if (rv == DONE) {
+            apr_table_setn(r->subprocess_env, "CROWDSEC_STATUS", "challenge");
+            /* An interstitial is a block as far as the metric is concerned:
+             * the request did not reach the origin.
+             */
+            crowdsec_metrics_dropped(sconf, ipt, origin);
+            return DONE;
+        }
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
+                      "crowdsec: a challenge was required for '%s' but could "
+                      "not be served; blocking instead", ip);
+        rem = CROWDSEC_REM_BAN;
+    }
+
+    if (rem >= CROWDSEC_REM_BAN) {
+        /* Counted here rather than inside crowdsec_apply, which the fallback
+         * path also reaches: a request blocked because the local API was
+         * unreachable has no decision behind it and so no origin to attribute
+         * it to. It is still counted as processed.
+         */
+        crowdsec_metrics_dropped(sconf, ipt, origin);
+        return crowdsec_apply(r, conf, rem, ip);
+    }
+
+    /* Allowed. Nothing under the challenge prefix may reach the origin even
+     * so: the engine answers what it owns there and the origin has nothing to
+     * serve. Logged at debug because the engine routes only a few paths under
+     * the prefix, so anyone can reach this with a made-up one - it is the
+     * expected answer for those, not a fault.
+     */
+    if (challenge_path) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+                      "crowdsec: '%s' is under the challenge prefix but the "
+                      "engine did not answer it; refusing rather than passing "
+                      "it to the origin", r->uri);
+        return HTTP_NOT_FOUND;
+    }
+
+    /* The body was consumed to inspect it, so put it back for the real
+     * handler. Only here: on any other path the request does not proceed.
+     */
+    crowdsec_appsec_replay(r, st);
+
+    return crowdsec_apply(r, conf, rem, ip);
+}
+
+/* ------------------------------------------------------- status handler */
+
+static int crowdsec_status_handler(request_rec *r)
+{
+    crowdsec_server_rec *sconf;
+    crowdsec_store_stats_t st;
+
+    if (!r->handler || strcmp(r->handler, "crowdsec-status")) {
+        return DECLINED;
+    }
+    if (r->method_number != M_GET) {
+        return HTTP_METHOD_NOT_ALLOWED;
+    }
+    sconf = ap_get_module_config(r->server->module_config, &crowdsec_module);
+
+    ap_set_content_type(r, "text/plain; charset=utf-8");
+    ap_rprintf(r, "mode: %s\n",
+               sconf->mode == CROWDSEC_MODE_STREAM ? "stream" : "live");
+    ap_rprintf(r, "url: %s\n", sconf->url ? sconf->url : "(unset)");
+    ap_rprintf(r, "cache: %s\n", sconf->cache_instance ? "yes" : "no");
+
+    crowdsec_metrics_status(r, sconf);
+
+    if (sconf->mode == CROWDSEC_MODE_STREAM
+        && crowdsec_store_stats(r->server, sconf, &st)) {
+        ap_rprintf(r, "primed: %s\n", st.primed_at ? "yes" : "no");
+        ap_rprintf(r, "pulls: %u\n", (unsigned int) st.pulls);
+        ap_rprintf(r, "stored: %u\n", (unsigned int) st.stored);
+        ap_rprintf(r, "retained: %u\n", (unsigned int) st.retained);
+        /* Without this the two figures above cannot be judged: they are from
+         * the last full pull, and how long ago that was depends on whether
+         * anything has asked for one.
+         */
+        ap_rprintf(r, "stored_age_s: %" APR_TIME_T_FMT "\n",
+                   st.stored_at ? apr_time_sec(apr_time_now() - st.stored_at)
+                   : -1);
+        ap_rprintf(r, "last_pull_age_ms: %" APR_TIME_T_FMT "\n",
+                   st.last_pull ? apr_time_as_msec(apr_time_now()
+                                                   - st.last_pull) : -1);
+    }
+    else if (sconf->mode == CROWDSEC_MODE_STREAM) {
+        ap_rputs("primed: no\n", r);
+    }
     return OK;
 }
 
-/**
- * Cap the input filter stack, returning nothing.
- */
-static apr_status_t null_in_filter(ap_filter_t * f, apr_bucket_brigade * bb,
-                                   ap_input_mode_t mode,
-                                   apr_read_type_e block, apr_off_t readbytes)
+/* ------------------------------------------------------------ lifecycle */
+
+static int crowdsec_pre_config(apr_pool_t *pconf, apr_pool_t *plog,
+                               apr_pool_t *ptmp)
 {
-    apr_bucket *e;
+    apr_status_t rv = ap_mutex_register(pconf, crowdsec_id, NULL,
+                                        APR_LOCK_DEFAULT, 0);
 
-    /* all the null filter does is insert an EOS, and then return success. */
-    e = apr_bucket_eos_create(f->c->bucket_alloc);
-    APR_BRIGADE_INSERT_TAIL(bb, e);
-
-    return APR_SUCCESS;
-}
-
-static void *create_crowdsec_dir_config(apr_pool_t * p, char *d)
-{
-    crowdsec_config_rec *conf = apr_pcalloc(p, sizeof(crowdsec_config_rec));
-
-    return conf;
-}
-
-static void *merge_crowdsec_dir_config(apr_pool_t * p, void *basev,
-                                       void *addv)
-{
-    crowdsec_config_rec *new = (crowdsec_config_rec *) apr_pcalloc(p,
-                                                                   sizeof
-                                                                   (crowdsec_config_rec));
-    crowdsec_config_rec *add = (crowdsec_config_rec *) addv;
-    crowdsec_config_rec *base = (crowdsec_config_rec *) basev;
-
-    new->enable = (add->enable_set == 0) ? base->enable : add->enable;
-    new->enable_set = add->enable_set || base->enable_set;
-
-    new->fallback = (add->fallback_set == 0) ? base->fallback : add->fallback;
-    new->fallback_set = add->fallback_set || base->fallback_set;
-
-    new->location = (add->location_set == 0) ? base->location : add->location;
-    new->location_set = add->location_set || base->location_set;
-
-    new->blockedhttpcode = (add->blockedhttpcode_set == 0) ? base->blockedhttpcode : add->blockedhttpcode;
-    new->blockedhttpcode_set = add->blockedhttpcode_set || base->blockedhttpcode_set;
-
-    return new;
-}
-
-static void *create_crowdsec_server_config(apr_pool_t * p, server_rec * s)
-{
-    crowdsec_server_rec *conf = apr_pcalloc(p, sizeof(crowdsec_server_rec));
-
-    conf->cache_timeout = apr_time_from_sec(CROWDSEC_CACHE_TIMEOUT_DEFAULT);
-
-    return conf;
-}
-
-/* cache-related settings are not merged here, but in the post_config hook,
- * since the cache has not yet sprung to life
- */
-static void *merge_crowdsec_server_config(apr_pool_t * p, void *basev,
-                                          void *addv)
-{
-    crowdsec_server_rec *new = (crowdsec_server_rec *) apr_pcalloc(p,
-                                                                   sizeof
-                                                                   (crowdsec_server_rec));
-    crowdsec_server_rec *add = (crowdsec_server_rec *) addv;
-    crowdsec_server_rec *base = (crowdsec_server_rec *) basev;
-
-    new->url = (add->url_set == 0) ? base->url : add->url;
-    new->url_set = add->url_set || base->url_set;
-
-    new->key = (add->key_set == 0) ? base->key : add->key;
-    new->key_set = add->key_set || base->key_set;
-
-    new->cache_provider =
-        (add->cache_provider_set ==
-         0) ? base->cache_provider : add->cache_provider;
-    new->cache_instance =
-        (add->cache_provider_set ==
-         0) ? base->cache_instance : add->cache_instance;
-    new->cache_provider_set = add->cache_provider_set
-        || base->cache_provider_set;
-
-    new->cache_timeout =
-        (add->cache_timeout_set ==
-         0) ? base->cache_timeout : add->cache_timeout;
-    new->cache_timeout_set = add->cache_timeout_set
-        || base->cache_timeout_set;
-
-    return new;
-}
-
-static int crowdsec_pre_config(apr_pool_t * pconf, apr_pool_t * plog,
-                               apr_pool_t * ptmp)
-{
-    apr_status_t rv = ap_mutex_register(pconf, crowdsec_id,
-                                        NULL, APR_LOCK_DEFAULT, 0);
     if (rv != APR_SUCCESS) {
         ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, plog,
                       "failed to register %s mutex", crowdsec_id);
         return 500;             /* An HTTP status would be a misnomer! */
     }
-
+    /* The metrics counters have a lock of their own: they are reached in live
+     * mode too, where there may be no decision cache and so no cache mutex.
+     */
+    rv = crowdsec_metrics_pre_config(pconf);
+    if (rv != APR_SUCCESS) {
+        ap_log_perror(APLOG_MARK, APLOG_CRIT, rv, plog,
+                      "failed to register the %s metrics mutex", crowdsec_id);
+        return 500;
+    }
     return OK;
 }
 
-static int crowdsec_post_config(apr_pool_t * pconf, apr_pool_t * plog,
-                                apr_pool_t * ptmp, server_rec * s)
+static int crowdsec_post_config(apr_pool_t *pconf, apr_pool_t *plog,
+                                apr_pool_t *ptmp, server_rec *s)
 {
-    apr_status_t status;
-
     server_rec *s_vhost;
+    int remoteip_loaded = ap_find_linked_module("mod_remoteip.c") != NULL;
 
-    static struct ap_socache_hints cache_hints = { 48, 256, 60000000 };
+    /* avg_id_len is 18: our longest key is family + prefix + 16 address bytes.
+     * avg_obj_size is 32, comfortably over the 5-byte decision value, so the
+     * provider sizes its subcaches for many small entries.
+     */
+    static struct ap_socache_hints cache_hints = { 18, 32, 60000000 };
 
-    s_vhost = s;
-    while (s_vhost) {
-
-        crowdsec_server_rec *sconf;
-
-        sconf = (crowdsec_server_rec *)
+    for (s_vhost = s; s_vhost; s_vhost = s_vhost->next) {
+        crowdsec_server_rec *sconf =
             ap_get_module_config(s_vhost->module_config, &crowdsec_module);
+        apr_status_t status;
 
-        if (sconf->cache_provider_set) {
-
+        /* Only the server_rec that created the instance sets it up. A vhost
+         * that inherited the pointer through the config merge would otherwise
+         * re-init the same shmcb segment, guard it with a second mutex that
+         * excludes nothing, and destroy it again at shutdown.
+         */
+        if (sconf->cache_owned) {
             status = ap_global_mutex_create(&sconf->cache_mutex, NULL,
                                             crowdsec_id, NULL, s_vhost, pconf,
                                             0);
             if (status != APR_SUCCESS) {
                 ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog,
                               "failed to create %s mutex", crowdsec_id);
-                return 500;     /* An HTTP status would be a misnomer! */
+                return 500;
             }
-            apr_pool_cleanup_register(pconf, (void *) s_vhost, cleanup_lock,
+            apr_pool_cleanup_register(pconf, s_vhost, cleanup_lock,
                                       apr_pool_cleanup_null);
 
-
-            status =
-                sconf->cache_provider->init(sconf->cache_instance,
-                                            crowdsec_id, &cache_hints,
-                                            s_vhost, pconf);
-
+            status = sconf->cache_provider->init(sconf->cache_instance,
+                                                 crowdsec_id, &cache_hints,
+                                                 s_vhost, pconf);
             if (status != APR_SUCCESS) {
                 ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog,
                               "failed to initialise %s cache", crowdsec_id);
-                return 500;     /* An HTTP status would be a misnomer! */
+                return 500;
             }
-            apr_pool_cleanup_register(pconf, (void *) s_vhost, cleanup_cache,
+            apr_pool_cleanup_register(pconf, s_vhost, cleanup_cache,
                                       apr_pool_cleanup_null);
 
+            status = crowdsec_meta_create(pconf, sconf);
+            if (status != APR_SUCCESS) {
+                ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog,
+                              "failed to create the %s shared control region",
+                              crowdsec_id);
+                return 500;
+            }
         }
 
-        s_vhost = s_vhost->next;
+        /* AppSec authenticates with the same bouncer key as the local API,
+         * so there is one directive for both.
+         */
+        if (!sconf->appsec_key) {
+            sconf->appsec_key = sconf->key;
+        }
+        if (sconf->appsec_url && !sconf->appsec_key) {
+            /* The engine answers 401 without a key, which would make every
+             * request take the failure action. Say so now instead.
+             */
+            ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
+                         "crowdsec: CrowdsecAppsecURL is set but "
+                         "CrowdsecAPIKey is not; AppSec cannot authenticate");
+            return 500;
+        }
+
+        if (!sconf->url && !sconf->appsec_url) {
+            continue;
+        }
+
+        /* Stream mode keeps every decision in the shared cache, so without one
+         * there is nowhere to put them and nothing would ever be blocked.
+         * Refuse at startup rather than fail open at runtime.
+         */
+        if (sconf->mode == CROWDSEC_MODE_STREAM && !sconf->cache_instance) {
+            ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
+                         "crowdsec: CrowdsecMode stream requires CrowdsecCache "
+                         "to be configured");
+            return 500;
+        }
+
+        if (crowdsec_metrics_create(pconf, plog, s, s_vhost) != APR_SUCCESS) {
+            ap_log_perror(APLOG_MARK, APLOG_CRIT, 0, plog,
+                          "failed to create the %s metrics region",
+                          crowdsec_id);
+            return 500;
+        }
+
+        if (remoteip_loaded) {
+            /* mod_remoteip's trusted-proxy list is private to it, so a notice
+             * is all we can offer: with RemoteIPHeader set and no trusted
+             * list, any client can choose the address we police.
+             */
+            ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, s_vhost,
+                         "crowdsec: mod_remoteip is loaded and this module "
+                         "trusts the address it reports; make sure "
+                         "RemoteIPTrustedProxy or RemoteIPInternalProxy is "
+                         "set, or use CrowdsecTrustUseragentIP off");
+        }
     }
 
+    /* A vhost that inherited the cache pointer has no mutex of its own, and
+     * store_lock treats a NULL mutex as "nothing to lock" - so without this it
+     * would read and write the shared segment unsynchronised. Hand it the
+     * owner's mutex, and refuse to start if there is somehow no owner rather
+     * than run unlocked.
+     */
+    for (s_vhost = s; s_vhost; s_vhost = s_vhost->next) {
+        crowdsec_server_rec *sconf =
+            ap_get_module_config(s_vhost->module_config, &crowdsec_module);
+        server_rec *owner;
 
+        if (!sconf->cache_instance || sconf->cache_mutex) {
+            continue;
+        }
+        for (owner = s; owner; owner = owner->next) {
+            crowdsec_server_rec *oconf =
+                ap_get_module_config(owner->module_config, &crowdsec_module);
+
+            if (oconf->cache_owned
+                && oconf->cache_instance == sconf->cache_instance) {
+                sconf->cache_mutex = oconf->cache_mutex;
+                sconf->meta_shm = oconf->meta_shm;
+                sconf->meta = oconf->meta;
+                break;
+            }
+        }
+        if (!sconf->cache_mutex) {
+            ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
+                         "crowdsec: the decision cache has no owning server; "
+                         "refusing to use it without a lock");
+            return 500;
+        }
+    }
+
+    /* Live and stream share one key space in that cache, and live mode stores
+     * allow at the full-width key while stream stores ban at the prefix - so a
+     * lookup answering from the exact address would let one server's cached
+     * allow shadow another's range ban. CrowdsecCache is main-server-only but
+     * CrowdsecMode is not, so the mismatch is reachable by configuration;
+     * refuse it here instead of failing open on some requests at runtime.
+     *
+     * Only servers with a CrowdsecURL count, and the first of them sets the
+     * reference rather than the cache's owner: an AppSec-only vhost never
+     * reaches the decision cache, and neither does a main server that declares
+     * the cache for its vhosts without polling itself. Either would otherwise
+     * impose the mode it never uses.
+     */
+    {
+        crowdsec_server_rec *ref = NULL;
+
+        for (s_vhost = s; s_vhost; s_vhost = s_vhost->next) {
+            crowdsec_server_rec *sconf =
+                ap_get_module_config(s_vhost->module_config, &crowdsec_module);
+
+            if (!sconf->cache_instance || !sconf->url) {
+                continue;
+            }
+            if (!ref) {
+                ref = sconf;
+                continue;
+            }
+            if (ref->cache_instance == sconf->cache_instance
+                && ref->mode != sconf->mode) {
+                ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
+                             "crowdsec: this server shares a CrowdsecCache "
+                             "with one in CrowdsecMode %s, so it cannot be %s. "
+                             "Use one mode for every server sharing the cache.",
+                             ref->mode == CROWDSEC_MODE_STREAM
+                             ? "stream" : "live",
+                             sconf->mode == CROWDSEC_MODE_STREAM
+                             ? "stream" : "live");
+                return 500;
+            }
+        }
+    }
     return OK;
 }
 
-static const char *set_crowdsec(cmd_parms * cmd, void *dconf, int flag)
+static void crowdsec_child_init(apr_pool_t *pchild, server_rec *s)
 {
-    crowdsec_config_rec *conf = dconf;
+    server_rec *s_vhost;
+    apr_reslist_t *handles = NULL;
+    int threads = 1;
 
-    conf->enable = flag;
-    conf->enable_set = 1;
+    /* curl_global_init is documented as not thread-safe and sets up TLS
+     * library state that does not survive a fork cleanly, so it belongs here
+     * rather than in post_config, which also runs twice and in the parent.
+     */
+    if (crowdsec_http_child_init(pchild) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s,
+                     "crowdsec: could not initialise libcurl; this child will "
+                     "apply CrowdsecFallback to every request");
+        return;
+    }
+    if (!crowdsec_http_proto_ok()) {
+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s,
+                     "crowdsec: this libcurl accepts neither protocol "
+                     "allowlist option, so requests are not confined to "
+                     "http and https");
+    }
 
-    return NULL;
+    ap_mpm_query(AP_MPMQ_MAX_THREADS, &threads);
+    if (threads < 1) {
+        threads = 1;
+    }
+    /* Plus two for the background threads - the stream poller and the metrics
+     * reporter - which borrow from the same pool. Sized so that acquiring a
+     * handle can never block, because a blocked request is a request whose
+     * latency we have handed to whatever the other thread is waiting on.
+     */
+    threads += 2;
+
+    /* One pool for the whole child, not one per vhost. The handles carry no
+     * per-vhost state - every option is set per exchange - so a pool each
+     * would multiply the handle count by the number of vhosts for no gain.
+     * Sized at one handle per worker thread, so acquiring one can never block
+     * and turn engine latency into a stalled request.
+     */
+    if (crowdsec_http_pool_create(pchild, threads, &handles) != APR_SUCCESS) {
+        ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s,
+                     "crowdsec: could not create the curl handle pool; this "
+                     "child will apply CrowdsecFallback to every request");
+        return;
+    }
+
+    for (s_vhost = s; s_vhost; s_vhost = s_vhost->next) {
+        crowdsec_server_rec *sconf =
+            ap_get_module_config(s_vhost->module_config, &crowdsec_module);
+
+        /* Either endpoint needs handles. Guarding on url alone left an
+         * AppSec-only configuration (CrowdsecAppsecURL without CrowdsecURL,
+         * which post_config accepts) with no handles at all, so every
+         * inspection failed instantly and the default passthrough let
+         * everything by uninspected - silently.
+         */
+        if ((!sconf->url && !sconf->appsec_url) || sconf->curl_handles) {
+            continue;           /* vhosts sharing a config share its handles */
+        }
+        sconf->curl_handles = handles;
+        if (crowdsec_memo_init(pchild, sconf) != APR_SUCCESS) {
+            ap_log_error(APLOG_MARK, APLOG_CRIT, 0, s_vhost,
+                         "crowdsec: could not create the decision memo");
+        }
+    }
+
+    crowdsec_poller_start(pchild, s);
+    crowdsec_metrics_start(pchild, s);
 }
 
-
-
-static const char *set_crowdsec_fallback(cmd_parms * cmd, void *dconf, const char *fallback)
-{
-    crowdsec_config_rec *conf = dconf;
-
-    if (!strcmp(fallback, "fail")) {
-        conf->fallback = CROWDSEC_FAIL;
-    }
-    else if (!strcmp(fallback, "block")) {
-        conf->fallback = CROWDSEC_BLOCK;
-    }
-    else if (!strcmp(fallback, "allow")) {
-        conf->fallback = CROWDSEC_ALLOW;
-    }
-    else {
-        return apr_psprintf(cmd->pool,
-                            "Unknown CrowdsecFallback '%s'. Valid values "
-                            "are 'fail', 'block' and 'allow'.", fallback);
-    }
-
-    conf->fallback_set = 1;
-
-    return NULL;
-}
-
-
-static const char *set_crowdsec_blockedhttpcode(cmd_parms * cmd, void *dconf, const char *blockedhttpcode)
-{
-    crowdsec_config_rec *conf = dconf;
-    int http_code = atoi(blockedhttpcode);
-
-    //let's restrict to a few values to avoid weird stuff:
-    // 200, 403, 500, 429
-    switch (http_code) {
-        case HTTP_FORBIDDEN:
-        case HTTP_INTERNAL_SERVER_ERROR:
-        case HTTP_TOO_MANY_REQUESTS:
-        //case 418: /*Apache won't let me do that :<*/
-            conf->blockedhttpcode = http_code;
-            break;
-        default:
-            return apr_psprintf(cmd->pool,
-                                "Unknown CrowdsecBlockedHTTPCode '%s'. Valid values "
-                                "are 403, 500 and 429.", blockedhttpcode);
-    }
-
-    conf->blockedhttpcode_set = 1;
-
-    return NULL;
-}
-
-static const char *set_crowdsec_location(cmd_parms *cmd, void *dconf,
-                                const char *location)
-{
-    crowdsec_config_rec *conf = dconf;
-
-    const char *expr_err = NULL;
-
-    conf->location = ap_expr_parse_cmd(cmd, location, AP_EXPR_FLAG_STRING_RESULT,
-            &expr_err, NULL);
-    if (expr_err) {
-        return apr_pstrcat(cmd->temp_pool,
-                "crowdsec: cannot parse expression '", location, "' in CrowdsecLocation: ",
-                      expr_err, NULL);
-    }
-
-    conf->location_set = 1;
-
-    return NULL;
-}
-
-static const char *set_crowdsec_url(cmd_parms * cmd, void *dconf,
-                                    const char *url)
-{
-    crowdsec_server_rec *sconf = (crowdsec_server_rec *)
-        ap_get_module_config(cmd->server->module_config,
-                             &crowdsec_module);
-
-    sconf->url = url;
-    sconf->url_set = 1;
-
-    return NULL;
-}
-
-static const char *set_crowdsec_api_key(cmd_parms * cmd, void *dconf,
-                                        const char *key)
-{
-    crowdsec_server_rec *sconf = (crowdsec_server_rec *)
-        ap_get_module_config(cmd->server->module_config,
-                             &crowdsec_module);
-
-    sconf->key = key;
-    sconf->key_set = 1;
-
-    return NULL;
-}
-
-static const char *set_crowdsec_cache(cmd_parms * cmd, void *dconf,
-                                      const char *cache)
-{
-    crowdsec_server_rec *sconf = (crowdsec_server_rec *)
-        ap_get_module_config(cmd->server->module_config,
-                             &crowdsec_module);
-
-    const char *err;
-    const char *param, *name;
-
-    /* Argument is of form 'name:args' or just 'name'. */
-    param = ap_strchr_c(cache, ':');
-    if (param) {
-        name = apr_pstrmemdup(cmd->pool, cache, param - cache);
-        param++;
-    }
-    else {
-        name = cache;
-    }
-
-    sconf->cache_provider =
-        ap_lookup_provider(AP_SOCACHE_PROVIDER_GROUP, name,
-                           AP_SOCACHE_PROVIDER_VERSION);
-    if (sconf->cache_provider == NULL) {
-        err = apr_psprintf(cmd->pool,
-                           "Unknown socache provider '%s'. Maybe you need "
-                           "to load the appropriate socache module "
-                           "(mod_socache_%s?)", name, name);
-    }
-    else {
-        err = sconf->cache_provider->create(&sconf->cache_instance, param,
-                                            cmd->temp_pool, cmd->pool);
-    }
-
-    if (err) {
-        err = apr_psprintf(cmd->pool, "CrowdsecCache: %s", err);
-
-        return err;
-    }
-
-    sconf->cache_provider_set = 1;
-
-    return err;
-}
-
-static const char *set_crowdsec_cache_timeout(cmd_parms * cmd, void *dconf,
-                                              const char *timeout)
-{
-    crowdsec_server_rec *sconf = (crowdsec_server_rec *)
-        ap_get_module_config(cmd->server->module_config,
-                             &crowdsec_module);
-
-    int secs = atoi(timeout);
-
-    sconf->cache_timeout = apr_time_from_sec(secs);
-    sconf->cache_timeout_set = 1;
-
-    return NULL;
-}
-
-static const command_rec crowdsec_cmds[] = {
-    AP_INIT_FLAG("Crowdsec",
-                 set_crowdsec, NULL, RSRC_CONF | ACCESS_CONF,
-                 "Enable crowdsec in the given location. Defaults to 'off'."),
-    AP_INIT_TAKE1("CrowdsecFallback",
-                  set_crowdsec_fallback, NULL, RSRC_CONF | ACCESS_CONF,
-                  "How to respond if the Crowdsec API is not available. 'fail' returns a 500 Internal Server Error. 'block' returns a 302 Redirect (or 429 Too Many Requests if CrowdsecLocation is unset). 'allow' will allow the request through. Default to 'fail'."),
- 
-    AP_INIT_TAKE1("CrowdsecBlockedHTTPCode",
-                  set_crowdsec_blockedhttpcode, NULL, RSRC_CONF | ACCESS_CONF,
-                  "Set the HTTP code to return when the IP address is blocked. Defaults to 429 Too Many Requests."),
-    AP_INIT_TAKE1("CrowdsecLocation",
-                  set_crowdsec_location, NULL, RSRC_CONF | ACCESS_CONF,
-                  "Set to the URL to redirect to when the IP address is banned. As per RFC 7231 may be a path, or a full URL. For example: /sorry.html"),
-    AP_INIT_TAKE1("CrowdsecURL",
-                  set_crowdsec_url, NULL, RSRC_CONF,
-                  "Set to the URL of the Crowdsec API. For example: http://localhost:8080."),
-    AP_INIT_TAKE1("CrowdsecAPIKey",
-                  set_crowdsec_api_key, NULL, RSRC_CONF,
-                  "Set to the API key of the Crowdsec API. Add an API key using 'cscli bouncers add'."),
-    AP_INIT_TAKE1("CrowdsecCache",
-                  set_crowdsec_cache, NULL, RSRC_CONF,
-                  "Enable the crowdsec cache. Defaults to 'none'. Options detailed here: https://httpd.apache.org/docs/2.4/socache.html."),
-    AP_INIT_TAKE1("CrowdsecCacheTimeout",
-                  set_crowdsec_cache_timeout, NULL, RSRC_CONF,
-                  "Set the crowdsec cache timeout. Defaults to 60 seconds."),
-    {NULL}
-};
-
-
-static void register_hooks(apr_pool_t * p)
+static void register_hooks(apr_pool_t *p)
 {
     ap_hook_pre_config(crowdsec_pre_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_post_config(crowdsec_post_config, NULL, NULL, APR_HOOK_MIDDLE);
-
-    ap_register_output_filter("CROWDSEC", crowdsec_out_filter, NULL,
-                              AP_FTYPE_CONTENT_SET);
-    ap_register_input_filter("CROWDSEC_NULL", null_in_filter, NULL,
-                             AP_FTYPE_CONTENT_SET);
-
+    ap_hook_child_init(crowdsec_child_init, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_handler(crowdsec_status_handler, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_access_checker(crowdsec_check_access, NULL, NULL, APR_HOOK_FIRST);
-
+    crowdsec_appsec_register(p);
 }
 
 AP_DECLARE_MODULE(crowdsec) = {
     STANDARD20_MODULE_STUFF,
-    create_crowdsec_dir_config, /* dir config creater */
-    merge_crowdsec_dir_config,  /* dir merger --- default is to override */
-    create_crowdsec_server_config,      /* server config */
-    merge_crowdsec_server_config,       /* merge server config */
-    crowdsec_cmds,              /* command apr_table_t */
-    register_hooks              /* register hooks */
+    create_crowdsec_dir_config,
+    merge_crowdsec_dir_config,
+    create_crowdsec_server_config,
+    merge_crowdsec_server_config,
+    crowdsec_cmds,
+    register_hooks
 };

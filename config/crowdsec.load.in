@@ -1,0 +1,1 @@
+LoadModule crowdsec_module @APXS_LIBEXECDIR@/mod_crowdsec.so

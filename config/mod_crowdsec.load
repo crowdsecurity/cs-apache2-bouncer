@@ -1,1 +1,0 @@
-LoadModule crowdsec_module /usr/lib/apache2/modules/mod_crowdsec.so

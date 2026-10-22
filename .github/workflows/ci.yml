@@ -1,0 +1,217 @@
+---
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - "**.md"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+  # So the full packaging matrix can be proven before tagging, without
+  # carrying it on every push.
+  workflow_dispatch:
+    inputs:
+      full_packages:
+        description: build every packaging target, not just the quick subset
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # apache2-dev brings apxs and the httpd headers; apache2 brings the MPMs and
+  # the modules the functional harness loads (proxy, rewrite, cgid, deflate,
+  # socache_shmcb). bats is packaged on both runners.
+  DEPS: >-
+    apache2 apache2-dev apache2-utils
+    libapr1-dev libaprutil1-dev libcurl4-openssl-dev
+    autoconf automake libtool pkg-config bats gettext-base
+
+jobs:
+  # 22.04 is not redundant: libcurl there is 7.81, which takes the
+  # CURLOPT_PROTOCOLS fallback rather than CURLOPT_PROTOCOLS_STR (7.85+).
+  build:
+    name: build + unit (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends $DEPS
+
+      - name: configure
+        run: |
+          autoreconf -fi
+          ./configure --with-apxs=/usr/bin/apxs2 --enable-werror
+
+      - name: build
+        run: make
+
+      - name: unit tests
+        run: make check || { cat test/unit/*.log 2>/dev/null; exit 1; }
+
+  functional:
+    name: bats (${{ matrix.os }}, mpm_${{ matrix.mpm }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        mpm: [prefork, event]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends $DEPS
+
+      - name: build the module and the test helpers
+        run: |
+          autoreconf -fi
+          ./configure --with-apxs=/usr/bin/apxs2 --enable-werror
+          make
+          make check
+          # The scanner-conformance module runs inside httpd, where ap_scan_*
+          # resolves; it is not part of the default target.
+          apxs2 -c -I. -o test/unit/mod_scan_conformance.la \
+            test/unit/mod_scan_conformance.c crowdsec_util.c
+
+      - name: stop the distro apache
+        # The runner has apache2 enabled on :80; the harness starts its own
+        # instance on a free port, but a running server competes for the
+        # default runtime directory and mutex names.
+        run: sudo systemctl stop apache2 || true
+
+      - name: bats
+        env:
+          HARNESS_MPM: ${{ matrix.mpm }}
+        # --print-output-on-failure arrived in bats-core 1.5; 22.04 packages
+        # 1.2, which exits on an unknown flag. Ask before using it.
+        run: |
+          flags=
+          if bats --help 2>&1 | grep -q -- --print-output-on-failure; then
+            flags=--print-output-on-failure
+          fi
+          bats $flags test/bats/
+
+  sanitizers:
+    name: asan + ubsan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends $DEPS
+
+      - name: build and run the unit drivers instrumented
+        # detect_stack_use_after_return is the setting that would have caught
+        # the pool cleanup registered against a stack address; it is off by
+        # default, so asking for it explicitly is the point of this job.
+        run: |
+          autoreconf -fi
+          ./configure --with-apxs=/usr/bin/apxs2
+          SAN="-fsanitize=address,undefined -fno-sanitize-recover=all"
+          SAN="$SAN -fsanitize-address-use-after-scope -g -Wall -Wextra -Werror"
+          YY="-DYYJSON_READER_DEPTH_LIMIT=8 -DYYJSON_DISABLE_WRITER=1"
+          YY="$YY -DYYJSON_DISABLE_INCR_READER=1 -DYYJSON_DISABLE_NON_STANDARD=1"
+          YY="$YY -DYYJSON_DISABLE_FILE=1 -DYYJSON_DISABLE_UTILS=1"
+          APR="$(pkg-config --cflags apr-1)"
+          gcc $SAN $APR -I. test/unit/t_util.c crowdsec_util.c \
+            $(pkg-config --libs apr-1) -o t_util_san
+          gcc $SAN $APR -I. -I./vendor/yyjson $YY test/unit/t_verdict.c \
+            crowdsec_verdict.c crowdsec_util.c vendor/yyjson/yyjson.c \
+            $(pkg-config --libs apr-1) -o t_verdict_san
+          export ASAN_OPTIONS=detect_stack_use_after_return=1:detect_leaks=1
+          ./t_util_san
+          ./t_verdict_san
+
+  # Reads the sources instead of running them, which is the half the sanitizers
+  # cannot reach: those only see what the unit drivers execute, and six of the
+  # eight sources need a live httpd to drive at all.
+  static-analysis:
+    name: static analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends $DEPS clang cppcheck
+
+      # configure runs only to generate config.h and crowdsec_version.h, which
+      # every source includes; nothing here links. Without --enable-werror on
+      # purpose: it would fold -Werror into ANALYZE_WARN for the advisory steps
+      # below as well, and only the gcc step is meant to gate.
+      - name: configure and collect flags
+        run: |
+          autoreconf -fi
+          ./configure --with-apxs=/usr/bin/apxs2
+          make -s print-analyzer-vars >> "$GITHUB_ENV"
+          echo "ANALYZE_INC=-I. -I./vendor/yyjson -I$(apxs2 -q INCLUDEDIR) $(pkg-config --cflags apr-1 apr-util-1 libcurl)" >> "$GITHUB_ENV"
+
+      # One source at a time, our code only - apxs hands one flag set to every
+      # source, which is why the Makefile already compiles yyjson separately.
+      # gcc 13: 22.04 ships 11, whose analyzer is weaker and noisier, so a
+      # matrix would buy noise rather than coverage. This baseline is clean, so
+      # it gates.
+      - name: gcc -fanalyzer
+        run: |
+          for f in $ANALYZE_SRC; do
+            echo "::group::$f"
+            gcc -fanalyzer -fanalyzer-call-summaries $ANALYZE_WARN -Werror \
+                $ANALYZE_INC $ANALYZE_DEFS -c -o /dev/null "$f"
+            echo "::endgroup::"
+          done
+
+      # A second opinion on the same sources: the two engines disagree often
+      # enough that both earn their place. Advisory until this baseline has
+      # been triaged - adding -Werror is what makes it gate.
+      - name: clang --analyze
+        continue-on-error: true
+        run: |
+          for f in $ANALYZE_SRC; do
+            echo "::group::$f"
+            clang --analyze -Xanalyzer -analyzer-output=text \
+                  $ANALYZE_INC $ANALYZE_DEFS -o /dev/null "$f"
+            echo "::endgroup::"
+          done
+
+      # A pattern sweep rather than path exploration, so it catches the
+      # sloppiness the two path analyzers skip. Our own include dirs only:
+      # pkg-config emits flags like -pthread that cppcheck rejects, and
+      # missingIncludeSystem covers what it then cannot find. Add
+      # --error-exitcode=1 to gate.
+      - name: cppcheck
+        continue-on-error: true
+        run: |
+          cppcheck --std=c11 --enable=warning,performance,portability \
+                   --inline-suppr --suppress=missingIncludeSystem --quiet \
+                   -I . -I vendor/yyjson $ANALYZE_DEFS $ANALYZE_SRC
+
+  # Per-target build and install test. The old job here built one deb on the
+  # runner and only listed its contents, so nothing checked that the package
+  # installs, that the maintainer scripts work, or that the config lands 0600.
+  #
+  # A quick subset by default - two debs and one rpm. The remaining targets
+  # differ in ways that are proven before a release rather than on every
+  # push; run this workflow manually with full_packages to get all of them.
+  packages:
+    name: packages
+    uses: ./.github/workflows/packages.yml
+    with:
+      full: ${{ github.event_name == 'workflow_dispatch' && inputs.full_packages }}

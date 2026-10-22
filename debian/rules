@@ -1,79 +1,27 @@
 #!/usr/bin/make -f
-# Sample debian/rules that uses debhelper.
-# GNU copyright 1997 to 1999 by Joey Hess.
 
-# Uncomment this to turn on verbose mode.
-export DH_VERBOSE=1
+export DH_VERBOSE = 1
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 
-CFLAGS:=$(shell dpkg-buildflags --get CFLAGS)
-CPPFLAGS:=$(shell dpkg-buildflags --get CPPFLAGS)
-LDFLAGS:=$(shell dpkg-buildflags --get LDFLAGS)
+%:
+	dh $@ --with apache2
 
+override_dh_auto_configure:
+	dh_auto_configure -- --with-apxs=/usr/bin/apxs2 --enable-werror
 
-PKGDIR=$(CURDIR)/debian/crowdsec-apache2-bouncer
-MODDIR=$(PKGDIR)/usr/lib/apache2/modules
+# Deliberately not a full "make install": dh_apache2 owns the module and the
+# mods-available pair here - it is what emits the apache2-api dependency and
+# the enmod/dismod maintainer-script snippets - so make supplies only the
+# bouncer's own files.
+override_dh_auto_install:
+	$(MAKE) install-bouncer-data DESTDIR=$(CURDIR)/debian/tmp
 
-build: build-arch build-indep
-build-arch: build-stamp
-build-indep:
-# Nothing to do here
-build-stamp:
-	dh_testdir
-	dh_autoreconf
-	dh_auto_configure -- --with-apxs=/usr/bin/apxs2 --with-apr=/usr/bin/apr-config --enable-collection-global-lock CPPFLAGS='$(CPPFLAGS)' CFLAGS='$(CFLAGS)' LDFLAGS='$(LDFLAGS)'
-	$(MAKE)
-	touch build-stamp
-
-clean:
-	dh_testdir
-	dh_testroot
-	rm -f build-stamp
-	[ ! -f Makefile ] || $(MAKE) distclean
-	dh_autoreconf_clean
-	dh_clean
-	rm -f config.log
-
-install: build
-	dh_testdir
-	dh_testroot
-	dh_prep
-	dh_installdirs
-	dh_install
-	dh_apache2
-
-binary-indep: build install
-	dh_testdir -i
-	dh_testroot -i
-	dh_installdocs -i
-	dh_installchangelogs -i
-	dh_link -i
-	dh_compress -i -Xexample
-	dh_fixperms -i
-	dh_installdeb -i
-	dh_gencontrol -i
-	dh_md5sums -i
-	dh_builddeb -i
-
-# Build architecture-dependent files here.
-binary-arch: build install
-	dh_testdir -a
-	dh_testroot -a
-	dh_installdocs -a
-#	mkdir -p debian/crowdsec-apache2-bouncer/etc/crowdsec/bouncers
-#	cp config/crowdsec-apache2-bouncer.conf debian/crowdsec-apache2-bouncer/etc/crowdsec/bouncers/
-	dh_link -a
-	dh_strip -a
-# don't compress examples
-	dh_compress -a -Xexample
-	dh_fixperms -a
-#	chown www-data debian/libapache2-mod-security2/var/cache/modsecurity
-#	dh_makeshlibs -a
-	dh_installdeb -a
-#	dh_perl -a
-	dh_shlibdeps -a
-	dh_gencontrol -a
-	dh_md5sums -a
-	dh_builddeb -a
-
-binary: binary-arch binary-indep
-.PHONY: build clean binary-indep binary-arch binary install build-arch build-indep
+# Forced rather than excluded from dh_fixperms, which is how the other crowdsec
+# bouncers do it: the mode is then independent of what the install step
+# happened to use. It matters most for the config, which holds the API key -
+# scripts/_bouncer.sh rewrites that file with a plain redirect, preserving
+# whatever mode it already has rather than imposing one, so a world-readable
+# config stays world-readable with the key in it.
+execute_after_dh_fixperms:
+	chmod 0600 debian/crowdsec-apache2-bouncer/etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf
+	chmod 0600 debian/crowdsec-apache2-bouncer/usr/lib/crowdsec-apache2-bouncer/_bouncer.sh

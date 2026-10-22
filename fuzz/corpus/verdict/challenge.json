@@ -1,0 +1,1 @@
+{"action":"challenge","http_status":200,"user_body_content":"<html><body>solve</body></html>","user_headers":{"Content-Type":["text/html; charset=utf-8"],"Content-Security-Policy":["default-src 'self'"]},"user_cookies":["__crowdsec_challenge=abc; Path=/; HttpOnly; SameSite=Lax"]}

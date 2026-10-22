@@ -1,0 +1,13 @@
+# Loaded from conf.modules.d, which httpd reads in filename order. Both
+# LoadModules are guarded because 00-base.conf may already have loaded
+# socache_shmcb, and because an operator may have loaded the module by hand.
+<IfModule !crowdsec_module>
+  LoadModule crowdsec_module @APXS_LIBEXECDIR@/mod_crowdsec.so
+</IfModule>
+
+# The shared cache holds decisions. It is required by CrowdsecMode stream and
+# strongly recommended in live mode, where it saves every child process making
+# its own API query for the same client.
+<IfModule !socache_shmcb_module>
+  LoadModule socache_shmcb_module @APXS_LIBEXECDIR@/mod_socache_shmcb.so
+</IfModule>

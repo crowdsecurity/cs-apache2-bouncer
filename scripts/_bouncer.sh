@@ -119,9 +119,15 @@ set_config_var_value() {
     fi
 
     before=$(cat "$CONFIG")
-    echo "$before" | \
-        env "$varname=$value" envsubst "\$$varname" | \
-        install -m 0600 /dev/stdin "$CONFIG"
+    # Not "install -m 0600 /dev/stdin": Ubuntu 26.04 ships uutils coreutils
+    # (package coreutils-from-uutils), whose install fails with a misleading
+    # "No such file or directory" when the source is a FIFO and the target
+    # already exists - which it always is here, because the package ships this
+    # config. The key then never reaches the file while the bouncer is already
+    # registered, so the install looks fine and nothing works.
+    # Matches the fix in cs-firewall-bouncer#423.
+    (umask 177 && echo "$before" | \
+        env "$varname=$value" envsubst "\$$varname" >"$CONFIG")
 }
 
 set_api_key() {

@@ -2,14 +2,32 @@ Source: crowdsec-apache2-bouncer
 Section: httpd
 Priority: optional
 Maintainer: Crowdsec Team <support@crowdsec.net>
-Build-Depends: debhelper, apache2-dev, pkg-config
-Standards-Version: 1.0.0
-Homepage: https://github.com/buixor/mod_crowdsec
 Uploaders: Crowdsec Team <support@crowdsec.net>
-
+Build-Depends: debhelper-compat (= 13),
+               apache2-dev,
+               autoconf,
+               automake,
+               libtool,
+               pkg-config,
+               libcurl4-openssl-dev
+Standards-Version: 4.6.2
+Homepage: https://github.com/crowdsecurity/cs-apache2-bouncer
+Rules-Requires-Root: no
 
 Package: crowdsec-apache2-bouncer
-Provides: crowdsec-apache2-bouncer
-Description: Apache2 Bouncer
 Architecture: any
-Depends: apache2
+# gettext-base for envsubst, which the maintainer scripts use to write the API
+# key into the config. It is only Priority: standard and apache2 does not pull
+# it in, and without it the config keeps the literal $API_KEY placeholder.
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         apache2,
+         gettext-base
+Description: CrowdSec bouncer for the Apache 2 HTTP server
+ mod_crowdsec asks a CrowdSec local API for a verdict on each client and then
+ blocks, challenges or allows the request. Decisions are taken either per
+ request or from the decision stream, polled in the background into a shared
+ cache so that no request waits on the API.
+ .
+ Requests can also be forwarded to the CrowdSec AppSec component for WAF
+ inspection and bot detection, including serving the challenge interstitial.

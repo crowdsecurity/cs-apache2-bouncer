@@ -1,5 +1,10 @@
 #!/bin/sh
 
-a2dismod  mod_crowdsec
-systemctl try-reload-or-restart apache2
+set -e
 
+# Nothing of our own here. dh_apache2's snippet disables the module and reloads
+# apache, and the bouncer is deregistered from the local API in postrm on
+# purge, not here: on a plain remove the config file is kept, so deleting the
+# bouncer would leave a retained config holding a key that no longer exists -
+# and need_api_key would see a key set and not register a new one.
+#DEBHELPER#

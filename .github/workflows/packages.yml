@@ -1,0 +1,252 @@
+---
+# Builds and install-tests a package per target. Called by ci.yml for a quick
+# subset on every push, and by release.yml for the full matrix on a tag.
+#
+# The build runs in "docker run" on a host runner rather than a job-level
+# "container:", because a container job needs a node runtime inside the image
+# for actions/checkout and the EL images do not reliably have one. It also
+# keeps the invocation identical to what a developer runs locally.
+name: packages
+
+on:
+  workflow_call:
+    inputs:
+      full:
+        description: build every target rather than the quick subset
+        type: boolean
+        default: false
+      arches:
+        description: JSON array of architectures
+        type: string
+        default: '["amd64"]'
+      upload:
+        description: upload the packages as workflow artifacts
+        type: boolean
+        default: false
+      version:
+        description: >-
+          package version to stamp, e.g. 1.0.0~rc1. Empty means take it from
+          configure.ac, which is what a push build wants. Release builds pass
+          the tag so that a prerelease produces a package apt and dnf can
+          actually tell apart from the final one.
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  # One source of truth for the target list, filtered down for push builds.
+  # Nine jobs on every push is a lot of wall clock for what changes between
+  # most of these targets, so the quick subset keeps the axes that actually
+  # differ and the rest are proven before a release instead.
+  targets:
+    name: pick targets
+    runs-on: ubuntu-24.04
+    outputs:
+      deb: ${{ steps.pick.outputs.deb }}
+      rpm: ${{ steps.pick.outputs.rpm }}
+    steps:
+      - id: pick
+        run: |
+          # What each target is here for:
+          #   bullseye  oldest deb, libcurl 7.74 (pre-7.85 setopt path)
+          #   bookworm  Debian stable, non-t64 dependency names
+          #   trixie    t64 names, newest debhelper
+          #   jammy     libcurl 7.81, also pre-7.85
+          #   noble     t64 names, libcurl 8.5
+          #   el8       apr 1.6, python 3.6, httpd 2.4.37, full curl
+          #   el9       httpd-core split, curl-minimal, apr 1.7
+          #   el10      newest EL
+          #   rocky9    cross-check that the el9 artifact is interchangeable
+          deb_all='[
+            {"image":"debian:bullseye","name":"bullseye"},
+            {"image":"debian:bookworm","name":"bookworm"},
+            {"image":"debian:trixie","name":"trixie"},
+            {"image":"ubuntu:22.04","name":"jammy"},
+            {"image":"ubuntu:24.04","name":"noble"}
+          ]'
+          rpm_all='[
+            {"image":"almalinux:8","name":"el8","publish":true},
+            {"image":"almalinux:9","name":"el9","publish":true},
+            {"image":"almalinux:10","name":"el10","publish":true},
+            {"image":"rockylinux:9","name":"rocky9","publish":false}
+          ]'
+          # bookworm and noble between them cover non-t64 and t64 dependency
+          # naming, which is where the deb packaging actually varies; el9 is
+          # the EL release closest to what most people run.
+          quick_deb='["bookworm","noble"]'
+          quick_rpm='["el9"]'
+
+          if [ "${{ inputs.full }}" = "true" ]; then
+            deb=$(echo "$deb_all" | jq -c .)
+            rpm=$(echo "$rpm_all" | jq -c .)
+          else
+            deb=$(echo "$deb_all" | jq -c --argjson q "$quick_deb" \
+                  '[.[] | select(.name as $n | $q | index($n))]')
+            rpm=$(echo "$rpm_all" | jq -c --argjson q "$quick_rpm" \
+                  '[.[] | select(.name as $n | $q | index($n))]')
+          fi
+
+          # The cross product with the architectures happens here rather than
+          # as a second matrix dimension with "include" supplying the runner.
+          # An include entry whose keys match no existing combination does not
+          # extend anything - it adds a combination of its own - so on a
+          # single-architecture build the arm64 runner mapping produced an
+          # extra job with no target, and docker got an empty image name.
+          runners='{"amd64":"ubuntu-24.04","arm64":"ubuntu-24.04-arm"}'
+          expand() {
+            jq -c --argjson a '${{ inputs.arches }}' --argjson r "$runners" \
+              '[ .[] as $t | $a[] as $arch
+                 | $t + {arch: $arch, runner: $r[$arch]} ]'
+          }
+          deb=$(echo "$deb" | expand)
+          rpm=$(echo "$rpm" | expand)
+
+          echo "deb=$deb" >> "$GITHUB_OUTPUT"
+          echo "rpm=$rpm" >> "$GITHUB_OUTPUT"
+          echo "deb jobs: $deb"
+          echo "rpm jobs: $rpm"
+
+  deb:
+    name: deb ${{ matrix.job.name }} ${{ matrix.job.arch }}
+    needs: targets
+    runs-on: ${{ matrix.job.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.targets.outputs.deb) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build and smoke-test
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" \
+            -e DEBIAN_FRONTEND=noninteractive \
+            -e PKG_VERSION="${{ inputs.version }}" \
+            "${{ matrix.job.image }}" sh -ec '
+              # bullseye is EOL and its security suite has moved, so the stock
+              # image ships apt lists that 404 on every fetch.
+              if grep -q bullseye /etc/os-release; then
+                sed -i "s|deb.debian.org|archive.debian.org|g; /bullseye-updates/d" \
+                  /etc/apt/sources.list
+                echo "Acquire::Check-Valid-Until \"false\";" \
+                  > /etc/apt/apt.conf.d/99-archive
+              fi
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends \
+                build-essential debhelper devscripts dpkg-dev lintian \
+                apache2 apache2-dev libcurl4-openssl-dev \
+                autoconf automake libtool pkg-config gettext-base \
+                python3 curl
+              # Out of the read-only mount, and in its own parent so the built
+              # .deb cannot be confused with anything else.
+              mkdir -p /build && cp -a /src /build/pkg && cd /build/pkg
+              # Same mechanism as the release pipeline, which regenerates the
+              # changelog with dch rather than trusting the committed one.
+              if [ -n "${PKG_VERSION:-}" ]; then
+                rm -f debian/changelog
+                NAME="Crowdsec Team" DEBEMAIL=debian@crowdsec.net \
+                  dch --package crowdsec-apache2-bouncer -v "$PKG_VERSION" \
+                      --create "release $PKG_VERSION"
+              fi
+              dpkg-buildpackage -us -uc -b
+              deb=$(ls /build/crowdsec-apache2-bouncer_*.deb | grep -v dbgsym)
+              # The mode on the config is the regression nothing else catches.
+              dpkg -c "$deb" | grep -E "^-rw-------.*bouncers/" \
+                || { echo "the bouncer config is not 0600 in the package" >&2; exit 1; }
+              apt-get install -y -qq "$deb"
+              /build/pkg/test/pkg/smoke.sh
+              lintian --fail-on error "$deb"
+              # No dbgsym: the rpm sets debug_package to nil, so shipping
+              # debug symbols for one format only would be odd.
+              for d in /build/*.deb; do
+                case "$d" in *dbgsym*) continue;; esac
+                cp "$d" /out/
+              done
+            '
+          # <source>_<version>_<arch>.deb says nothing about which distro built
+          # it, so every target produces the same filename and they would
+          # overwrite each other as release assets.
+          for f in out/*.deb; do
+            b=$(basename "$f" .deb)
+            mv "$f" "out/${b%_*}_${{ matrix.job.name }}_${b##*_}.deb"
+          done
+          ls -l out/
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.upload
+        with:
+          name: deb-${{ matrix.job.name }}-${{ matrix.job.arch }}
+          path: out/*.deb
+          if-no-files-found: error
+
+  rpm:
+    name: rpm ${{ matrix.job.name }} ${{ matrix.job.arch }}
+    needs: targets
+    runs-on: ${{ matrix.job.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.targets.outputs.rpm) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build and smoke-test
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/out:/out" \
+            -e PKG_VERSION="${{ inputs.version }}" \
+            "${{ matrix.job.image }}" sh -ec '
+              dnf -y -q install rpm-build rpmdevtools redhat-rpm-config \
+                gcc make autoconf automake libtool pkgconf-pkg-config \
+                httpd httpd-devel apr-devel apr-util-devel libcurl-devel \
+                gettext python3 procps-ng
+              # Not "install curl": EL9 ships curl-minimal, which already
+              # provides /usr/bin/curl and which the full curl package
+              # conflicts with, so asking for it fails there outright.
+              command -v curl >/dev/null || dnf -y -q install curl
+              cp -a /src /build && cd /build
+              # The same split build_rpms/matrix.yml does: a trailing
+              # -N is the rpm Release, anything else is the Version. A
+              # prerelease version is 1.0.0~rc1, which has no -, so it stays
+              # whole and rpm sorts it below 1.0.0 as intended.
+              v="${PKG_VERSION:-$(scripts/version.sh)}"
+              case "$v" in
+                *-*) export VERSION="${v%%-*}"; export PACKAGE_NUMBER="${v#*-}";;
+                *)   export VERSION="$v"; export PACKAGE_NUMBER=1;;
+              esac
+              export RELEASEVER=el$(rpm -E %rhel)
+              echo "building version $VERSION release $PACKAGE_NUMBER"
+              rpmdev-setuptree
+              # The same shape the release pipeline uses: the source tarball is
+              # the checkout, not a make dist.
+              tar czf ~/rpmbuild/SOURCES/v$VERSION.tar.gz \
+                --transform "s|^\.|crowdsec-apache2-bouncer-$VERSION|" \
+                --exclude=.git .
+              cp rpm/SPECS/crowdsec-apache2-bouncer.spec ~/rpmbuild/SPECS/
+              rpmbuild -bs ~/rpmbuild/SPECS/crowdsec-apache2-bouncer.spec
+              rpmbuild -bb ~/rpmbuild/SPECS/crowdsec-apache2-bouncer.spec
+              rpm=$(ls ~/rpmbuild/RPMS/*/crowdsec-apache2-bouncer-*.rpm)
+              # An undefined macro would otherwise reach Requires verbatim and
+              # the package would be uninstallable at the user end, not here.
+              rpm -qp --requires "$rpm" | grep "%{" \
+                && { echo "unexpanded macro in Requires" >&2; exit 1; }
+              rpm -qlv "$rpm" | grep -E "^-rw-------.*bouncers/" \
+                || { echo "the bouncer config is not 0600 in the package" >&2; exit 1; }
+              rpm -i "$rpm"
+              /build/test/pkg/smoke.sh
+              cp ~/rpmbuild/RPMS/*/*.rpm ~/rpmbuild/SRPMS/*.rpm /out/
+            '
+          ls -l out/
+
+      # publish:false targets are cross-checks, not artifacts: rocky9 produces
+      # the same .el9 filename almalinux:9 does, so uploading both would just
+      # be one silently replacing the other.
+      - uses: actions/upload-artifact@v4
+        if: inputs.upload && matrix.job.publish
+        with:
+          name: rpm-${{ matrix.job.name }}-${{ matrix.job.arch }}
+          path: out/*.rpm
+          if-no-files-found: error

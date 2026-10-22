@@ -1,24 +1,35 @@
 #!/bin/sh
 
-systemctl daemon-reload
+set -e
 
-#shellcheck source=./scripts/_bouncer.sh
-. "/usr/lib/$DPKG_MAINTSCRIPT_PACKAGE/_bouncer.sh"
 START=1
 
 if [ "$1" = "configure" ]; then
-    if need_api_key; then
-        if ! set_api_key; then
-            START=0
+    # In a subshell on purpose. _bouncer.sh turns on "set -eu", and the
+    # debhelper snippet below sources /etc/apache2/envvars through
+    # apache2-maintscript-helper; envvars reads APACHE_CONFDIR without
+    # checking it is set, so under set -u the whole postinst aborts and the
+    # module never gets enabled. Keeping the options inside the subshell also
+    # means nothing after this point depends on them.
+    if ! (
+        #shellcheck source=./scripts/_bouncer.sh
+        . "/usr/lib/$DPKG_MAINTSCRIPT_PACKAGE/_bouncer.sh"
+        rc=0
+        if need_api_key; then
+            set_api_key || rc=1
         fi
+        set_local_port
+        exit "$rc"
+    ); then
+        START=0
     fi
 fi
 
-set_local_port
+# Must come after the key is written: this is where dh_apache2 enables the
+# module and reloads apache, and the config it reloads needs the real key
+# rather than the $API_KEY placeholder.
+#DEBHELPER#
 
-a2enmod  mod_crowdsec
 if [ "$START" -eq 0 ]; then
-    echo "no api key was generated, you can generate one on your LAPI server by running 'cscli bouncers add <bouncer_name>' and add it to '$CONFIG'" >&2
-else
-    systemctl try-reload-or-restart apache2
+    echo "no api key was generated; run 'cscli bouncers add <bouncer_name>' on your LAPI server and put the key in /etc/crowdsec/bouncers/crowdsec-apache2-bouncer.conf" >&2
 fi

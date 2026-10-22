@@ -9,7 +9,7 @@ Makefile.in
 .deps/
 .dirstamp
 /build-stamp
-/.libs/
+.libs/
 
 # http://www.gnu.org/software/autoconf
 
@@ -29,6 +29,7 @@ autom4te.cache
 /configure.scan
 /depcomp
 /install-sh
+/INSTALL
 /missing
 /stamp-h1
 
@@ -48,6 +49,10 @@ m4/ltsugar.m4
 m4/ltversion.m4
 m4/lt~obsolete.m4
 
+# make dist output
+/*.tar.gz
+/*.tar.bz2
+
 # Generated Makefile
 # (meta build system like autotools,
 # can automatically generate from config.status script
@@ -55,10 +60,10 @@ m4/lt~obsolete.m4
 Makefile
 
 *.la
+*.lai
 *.lo
 *.o
 *.slo
-*.spec
 
 # Ignore Debian package-specific temporary files
 .debhelper/
@@ -72,3 +77,24 @@ debian/*.debhelper
 debian/*.substvars
 debian/autoreconf.*
 debian/crowdsec-apache2-bouncer/
+
+# editor
+.vscode/
+*~
+
+# automake test driver output
+/test-suite.log
+*.trs
+*.log
+# compiled unit-test binaries
+/test/unit/t_util
+/test/unit/t_verdict
+/test/unit/t_http
+/test/unit/t_metrics
+crowdsec_version.h
+# generated from the .in templates by configure; the module and apache paths
+# in them come from apxs
+/config/crowdsec.load
+/config/crowdsec.conf
+/config/10-crowdsec.conf
+/config/crowdsec-include.conf

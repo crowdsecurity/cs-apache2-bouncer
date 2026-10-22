@@ -1,0 +1,101 @@
+---
+# Tagged releases. Derives the package version from the tag, builds every
+# target for both architectures, and attaches the packages to a GitHub
+# release.
+#
+# Tag v1.0.0 for a release and v1.0.0-rc1 for a prerelease. The package
+# version becomes 1.0.0~rc1: git refuses a ~ in a tag name, while dpkg and rpm
+# both sort ~ below nothing, so the tilde is what makes 1.0.0~rc1 upgrade
+# cleanly to 1.0.0. This is the same rewrite the packaging pipeline does.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    name: version from tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -eu
+          rel="${GITHUB_REF_NAME#v}"
+          # -rc -> ~rc, as codepipeline/fetch_sources/placeholder does.
+          version=$(printf '%s' "$rel" | sed 's/-rc/~rc/g')
+          # Everything before the first ~ or - is the upstream version, which
+          # is what configure.ac declares.
+          base=${version%%[~-]*}
+          src=$(scripts/version.sh)
+          if [ "$base" != "$src" ]; then
+            echo "tag $GITHUB_REF_NAME implies upstream version $base," \
+                 "but configure.ac says $src" >&2
+            exit 1
+          fi
+          case "$GITHUB_REF_NAME" in
+            *-rc*) prerelease=true;;
+            *)     prerelease=false;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "tag $GITHUB_REF_NAME -> package version $version (prerelease=$prerelease)"
+
+  packages:
+    name: packages
+    needs: version
+    uses: ./.github/workflows/packages.yml
+    with:
+      full: true
+      arches: '["amd64","arm64"]'
+      upload: true
+      version: ${{ needs.version.outputs.version }}
+
+  release:
+    name: github release
+    needs: [version, packages]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: check what we are about to publish
+        run: |
+          ls -l artifacts
+          test -n "$(ls artifacts/*.deb 2>/dev/null)" || { echo "no debs" >&2; exit 1; }
+          test -n "$(ls artifacts/*.rpm 2>/dev/null)" || { echo "no rpms" >&2; exit 1; }
+          # The version has to be in the filenames, or a prerelease would be
+          # indistinguishable from the release it precedes.
+          v='${{ needs.version.outputs.version }}'
+          set -- artifacts/*"$v"*.deb
+          test -e "$1" || { echo "no deb carries version $v" >&2; exit 1; }
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          # Read back by the packaging pipeline, which routes a prerelease to
+          # the -testing packagecloud repositories.
+          prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+
+      # TODO: nothing here pushes to packagecloud, and it should stay that way.
+      # Publishing the release fires the webhook that starts the CodePipeline
+      # in crowdsecurity/packaging. That lane cannot ship these packages yet -
+      # disable_rpm is true for this product, update_rpm has no APACHE_BOUNCER
+      # branch, and the deb publish step fans one bookworm build out to every
+      # distro. See docs/packaging.md.
+      - name: publishing is handled outside this repo
+        run: |
+          echo "Packages are attached to the GitHub release."
+          echo "packagecloud publishing happens in crowdsecurity/packaging;"
+          echo "see docs/packaging.md for the changes that lane still needs."

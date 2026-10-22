@@ -1,0 +1,15 @@
+#!/bin/sh
+
+set -e
+
+# The mods-enabled entries are symlinks created by a2enmod, not conffiles, so
+# dpkg will not follow the mv_conffile rename in debian/*.maintscript and they
+# would be left pointing at the old mods-available names after the upgrade -
+# which breaks the apache config outright. Removing them here is safe: the
+# postinst enables the module again under its new name.
+if [ "$1" = "upgrade" ]; then
+    rm -f /etc/apache2/mods-enabled/mod_crowdsec.load \
+          /etc/apache2/mods-enabled/mod_crowdsec.conf
+fi
+
+#DEBHELPER#

@@ -43,6 +43,12 @@
 
 /* must be last: see the file for why */
 #include "crowdsec_poison.h"
+
+/* AP_DECLARE_MODULE tags mod_crowdsec.c only; without this, lines logged
+ * here show as [:level] and "LogLevel crowdsec:..." does not reach them.
+ */
+APLOG_USE_MODULE(crowdsec);
+
 /* ------------------------------------------------------------ config */
 
 void *create_crowdsec_dir_config(apr_pool_t *p, char *d)

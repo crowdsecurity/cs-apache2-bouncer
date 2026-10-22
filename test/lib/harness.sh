@@ -298,6 +298,14 @@ decision() {
         "${3:-1h0m0s}" "$2" "$1"
 }
 
+# decision_typed <value> <scope> <type> [duration]
+# Like decision(), but with another type: LAPI keeps one decision per type for
+# the same value.
+decision_typed() {
+    printf '{"duration":"%s","id":1,"origin":"cscli","scenario":"manual","scope":"%s","type":"%s","value":"%s"}' \
+        "${4:-1h0m0s}" "$2" "$3" "$1"
+}
+
 # decision_from <value> <scope> <origin> [scenario] [duration]
 # Like decision(), but with the origin the metrics attribute the block to. A
 # blocklist decision is origin "lists" plus the list name in scenario.

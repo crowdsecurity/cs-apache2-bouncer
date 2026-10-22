@@ -35,6 +35,7 @@ typedef struct
     apr_size_t keylen[MAX_SEEN];
     apr_interval_time_t dur[MAX_SEEN];
     char origin[MAX_SEEN][CROWDSEC_ORIGIN_LEN];
+    unsigned char type[MAX_SEEN];
     apr_status_t rv;            /* what to return, for the abort test */
 } collector_t;
 
@@ -49,6 +50,7 @@ static apr_status_t collect(void *ctx, int added,
                                               CROWDSEC_KEY_MAX);
         c->dur[c->n] = d->duration;
         apr_cpystrn(c->origin[c->n], d->origin, CROWDSEC_ORIGIN_LEN);
+        c->type[c->n] = d->type;
         c->n++;
     }
     return c->rv;
@@ -123,6 +125,38 @@ static void test_stream_deleted(apr_pool_t *p)
               &c, &st, &err), "both lists");
     CHECK(c.n == 2 && c.added[0] == 0 && c.added[1] == 1,
           "removal applied before the add");
+}
+
+static void test_stream_types(apr_pool_t *p)
+{
+    collector_t c;
+    crowdsec_decision_stats_t st;
+    const char *err;
+
+    /* The store keeps one expiry per type, so each must reach it distinctly,
+     * on a removal as much as on an add.
+     */
+    CHECK(run(p, "{\"deleted\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"type\":\"captcha\"}],"
+              "\"new\":[{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1h\",\"type\":\"ban\"},"
+              "{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1m\",\"type\":\"CAPTCHA\"},"
+              "{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1m\"},"
+              "{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1m\",\"type\":\"throttle\"},"
+              "{\"scope\":\"Ip\",\"value\":\"1.2.3.4\","
+              "\"duration\":\"1m\",\"type\":\"Throttle\"}]}",
+              &c, &st, &err), "types: %s", err ? err : "");
+    CHECK(c.n == 6, "six decisions");
+    CHECK(c.added[0] == 0 && c.type[0] == CROWDSEC_DTYPE_CAPTCHA,
+          "a removal carries its type");
+    CHECK(c.type[1] == CROWDSEC_DTYPE_BAN, "ban");
+    CHECK(c.type[2] == CROWDSEC_DTYPE_CAPTCHA, "captcha, case-insensitively");
+    CHECK(c.type[3] == CROWDSEC_DTYPE_BAN, "a missing type reads as ban");
+    CHECK(c.type[4] > CROWDSEC_DTYPE_CAPTCHA, "a custom type has its own id");
+    CHECK(c.type[4] == c.type[5], "custom types fold case");
 }
 
 static void test_stream_rejects(apr_pool_t *p)
@@ -653,6 +687,7 @@ int main(void)
 
     test_stream_basic(p);
     test_stream_deleted(p);
+    test_stream_types(p);
     test_stream_rejects(p);
     test_stream_malformed_doc(p);
     test_depth_limit(p);

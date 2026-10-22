@@ -1,5 +1,6 @@
 #include <string.h>
 
+#include "apr_lib.h"
 #include "apr_strings.h"
 
 #include "yyjson.h"
@@ -113,6 +114,28 @@ static void decision_origin(yyjson_val *item, char *out, apr_size_t outlen)
     apr_cpystrn(out, origin, outlen);
 }
 
+/* See crowdsec_decision_t. FNV-1a over the lowercased name, kept clear of the
+ * fixed ids. Two custom types colliding only means they share a slot in the
+ * store, which is what every type did before types were told apart.
+ */
+static unsigned char decision_type(yyjson_val *item)
+{
+    const char *t = str_field(item, "type");
+    apr_uint32_t h = 2166136261u;
+
+    if (!t || !*t || !strcasecmp(t, "ban")) {
+        return CROWDSEC_DTYPE_BAN;
+    }
+    if (!strcasecmp(t, "captcha")) {
+        return CROWDSEC_DTYPE_CAPTCHA;
+    }
+    for (; *t; t++) {
+        h ^= (unsigned char) apr_tolower(*t);
+        h *= 16777619u;
+    }
+    return (unsigned char) (CROWDSEC_DTYPE_CAPTCHA + 1 + h % 253);
+}
+
 static int one_decision(yyjson_val *item, int added,
                         crowdsec_decision_cb cb, void *ctx,
                         crowdsec_decision_stats_t *stats,
@@ -162,6 +185,7 @@ static int one_decision(yyjson_val *item, int added,
     }
 
     decision_origin(item, d.origin, sizeof(d.origin));
+    d.type = decision_type(item);
 
     *cbrv = cb(ctx, added, &d);
     if (*cbrv != APR_SUCCESS) {

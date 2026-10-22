@@ -114,6 +114,35 @@ Crowdsec On"
     [ "$(http_status)" = 200 ]
 }
 
+@test "a short captcha does not cut a longer ban short" {
+    # Both types are enforced as a ban and share one cache entry per address.
+    # It used to take the last decision's expiry, so the 2s captcha arriving
+    # after the 1h ban unblocked the address after two seconds.
+    lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip),$(decision_typed 127.0.0.1 Ip captcha 2s)]}"
+    apache_start "$(stream_conf)"
+    wait_primed
+    [ "$(http_status)" = 429 ]
+    sleep 4
+    [ "$(http_status)" = 429 ]
+}
+
+@test "deleting one type leaves another type's ban in force" {
+    lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip),$(decision_typed 127.0.0.1 Ip captcha)]}"
+    apache_start "$(stream_conf)"
+    wait_primed
+    [ "$(http_status)" = 429 ]
+
+    # Only the captcha is withdrawn; it used to drop the whole entry.
+    lapi_set "{\"decisions\":[],\"deleted\":[$(decision_typed 127.0.0.1 Ip captcha)]}"
+    sleep 3
+    [ "$(http_status)" = 429 ]
+
+    # Then the ban, which leaves nothing.
+    lapi_set "{\"decisions\":[],\"deleted\":[$(decision 127.0.0.1 Ip)]}"
+    sleep 3
+    [ "$(http_status)" = 200 ]
+}
+
 @test "an expired decision is never stored" {
     lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip -5s)],\"sticky\":true}"
     apache_start "$(stream_conf)"

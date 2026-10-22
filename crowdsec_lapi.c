@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -53,11 +54,33 @@ apr_status_t crowdsec_meta_create(apr_pool_t *pconf,
     return APR_SUCCESS;
 }
 
-#define DECISION_VALUE_VERSION 2
+#define DECISION_VALUE_VERSION 3
 
-/* Five bytes per decision. Shmcb's own per-entry overhead dominates either
+/* How many decision types one network can carry at once. LAPI keeps a
+ * decision per (scope, type, value), so a ban and a captcha on the same
+ * address are two decisions with their own expiry, withdrawn separately. All
+ * of them are enforced as a ban, but folding them into one entry made the
+ * last write set the expiry and any removal drop the lot: a 1m captcha
+ * stored after a 4h ban unblocked the address after a minute.
+ *
+ * A fifth type is folded into whichever slot ends first, taking the longer
+ * expiry, so the address stays blocked at least as long as either. Four
+ * covers ban, captcha and two custom types, which is more than any real
+ * deployment puts on one address.
+ */
+#define DECISION_SLOTS 4
+
+typedef struct
+{
+    unsigned char type;         /* CROWDSEC_DTYPE_*, or a custom type's hash */
+    unsigned char exp[4];       /* expiry in seconds since the epoch, big-endian */
+} decision_slot_t;
+
+/* Six bytes plus five per decision type, stored at its used length, so a
+ * single-type entry is eleven. Shmcb's own per-entry overhead dominates either
  * way - the directive docs budget ~128 bytes per decision - so the sizing
- * guidance does not move.
+ * guidance does not move. Live mode stores no slots: its entries are verdicts
+ * with the cache's own lifetime, not decisions.
  *
  * The generation is split into two bytes rather than declared apr_uint16_t so
  * the struct has no padding: it is memcpy'd into the socache whole, and
@@ -77,7 +100,13 @@ typedef struct
     unsigned char origin;       /* slot id in the shared metrics table */
     unsigned char gen_hi;
     unsigned char gen_lo;
+    unsigned char nslots;
+    decision_slot_t slot[DECISION_SLOTS];
 } decision_value_t;
+
+#define VALUE_LEN(n) \
+    ((unsigned int) (offsetof(decision_value_t, slot) \
+                     + (n) * sizeof(decision_slot_t)))
 
 /* Hands out the next generation, skipping 0 - see crowdsec_meta. Caller holds
  * the lock.
@@ -100,9 +129,14 @@ static void gen_put(decision_value_t *v, apr_uint16_t g)
 /* Whether this value belongs to the snapshot in force. Caller holds the lock,
  * which every reader of meta already does.
  */
+static apr_uint16_t gen_get(const decision_value_t *v)
+{
+    return (apr_uint16_t) ((v->gen_hi << 8) | v->gen_lo);
+}
+
 static int gen_ok(const crowdsec_server_rec *sconf, const decision_value_t *v)
 {
-    apr_uint16_t g = (apr_uint16_t) ((v->gen_hi << 8) | v->gen_lo);
+    apr_uint16_t g = gen_get(v);
 
     return g == sconf->meta->gen
         || (sconf->meta->gen_applying && g == sconf->meta->gen_applying);
@@ -114,8 +148,108 @@ static int gen_ok(const crowdsec_server_rec *sconf, const decision_value_t *v)
 static int value_ok(const crowdsec_server_rec *sconf,
                     const decision_value_t *v, unsigned int vlen)
 {
-    return vlen == sizeof(*v) && v->version == DECISION_VALUE_VERSION
+    return vlen >= VALUE_LEN(0) && v->version == DECISION_VALUE_VERSION
+        && v->nslots <= DECISION_SLOTS && vlen == VALUE_LEN(v->nslots)
         && gen_ok(sconf, v);
+}
+
+/* Slot expiries are whole seconds, rounded up so a decision never ends early.
+ * Durations are capped at ten years, so this fits until 2096.
+ */
+static apr_uint32_t exp_to_sec(apr_time_t t)
+{
+    apr_time_t sec = apr_time_sec(t + APR_USEC_PER_SEC - 1);
+
+    if (sec <= 0) {
+        return 0;
+    }
+    return sec > (apr_time_t) 0xffffffffu ? 0xffffffffu : (apr_uint32_t) sec;
+}
+
+static apr_uint32_t slot_exp(const decision_slot_t *sl)
+{
+    return ((apr_uint32_t) sl->exp[0] << 24) | ((apr_uint32_t) sl->exp[1] << 16)
+        | ((apr_uint32_t) sl->exp[2] << 8) | (apr_uint32_t) sl->exp[3];
+}
+
+static void slot_set_exp(decision_slot_t *sl, apr_uint32_t sec)
+{
+    sl->exp[0] = (unsigned char) (sec >> 24);
+    sl->exp[1] = (unsigned char) (sec >> 16);
+    sl->exp[2] = (unsigned char) (sec >> 8);
+    sl->exp[3] = (unsigned char) sec;
+}
+
+/* Drops the slots whose decision has run out, so a removal does not keep an
+ * entry alive for a type that already lapsed.
+ */
+static void slots_prune(decision_value_t *v, apr_uint32_t now)
+{
+    unsigned char i = 0;
+
+    while (i < v->nslots) {
+        if (slot_exp(&v->slot[i]) <= now) {
+            v->slot[i] = v->slot[--v->nslots];
+        }
+        else {
+            i++;
+        }
+    }
+}
+
+static int slot_find(const decision_value_t *v, unsigned char type)
+{
+    int i;
+
+    for (i = 0; i < v->nslots; i++) {
+        if (v->slot[i].type == type) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* When the entry as a whole should lapse: the longest of its decisions. */
+static apr_time_t slots_expiry(const decision_value_t *v)
+{
+    apr_uint32_t max = 0;
+    int i;
+
+    for (i = 0; i < v->nslots; i++) {
+        if (slot_exp(&v->slot[i]) > max) {
+            max = slot_exp(&v->slot[i]);
+        }
+    }
+    return apr_time_from_sec(max);
+}
+
+/* Records one decision type's expiry in the entry, keeping the later of two
+ * for the same type - LAPI only sends the longest per type, but a delta can
+ * carry a shorter one created after a longer one that is still in force.
+ */
+static void slots_add(decision_value_t *v, unsigned char type,
+                      apr_uint32_t exp)
+{
+    int i = slot_find(v, type);
+
+    if (i < 0 && v->nslots < DECISION_SLOTS) {
+        i = v->nslots++;
+        v->slot[i].type = type;
+        slot_set_exp(&v->slot[i], 0);
+    }
+    else if (i < 0) {
+        int j;
+
+        /* Full: fold into the slot that ends first - see DECISION_SLOTS. */
+        for (i = 0, j = 1; j < v->nslots; j++) {
+            if (slot_exp(&v->slot[j]) < slot_exp(&v->slot[i])) {
+                i = j;
+            }
+        }
+    }
+    if (exp > slot_exp(&v->slot[i])) {
+        slot_set_exp(&v->slot[i], exp);
+    }
 }
 
 /* Which array a family's counters live in. */
@@ -229,11 +363,31 @@ static apr_status_t apply_yield(apply_ctx_t *a)
     return APR_SUCCESS;
 }
 
+/* The entry this batch already holds for a key, if any. Only an entry of the
+ * generation being written counts: a full pull must not inherit the decision
+ * types of the snapshot it replaces, or one withdrawn while nobody was
+ * polling would come back with it.
+ *
+ * Asked on every decision, a full pull included, because the types for one
+ * network arrive as separate decisions and have to be merged. That is one
+ * socache read per decision under the global lock, cheaper than the store it
+ * precedes.
+ */
+static int fetch_own(apply_ctx_t *a, const unsigned char *key,
+                     apr_size_t keylen, decision_value_t *v)
+{
+    unsigned int vlen = sizeof(*v);
+
+    return a->sconf->cache_provider->retrieve(a->sconf->cache_instance, a->s,
+                                              key, (unsigned int) keylen,
+                                              (unsigned char *) v, &vlen,
+                                              a->p) == APR_SUCCESS
+        && value_ok(a->sconf, v, vlen) && gen_get(v) == a->gen;
+}
+
 /* Whether this key is already in the store, and under which origin. Only ever
  * asked to keep the active_decisions gauge straight, so it is skipped when
- * there is no gauge and on a full pull, which recounts from scratch: either
- * way the answer goes unused, and on a full pull it would be six figures of
- * extra socache reads under the global lock.
+ * there is no gauge and on a full pull, which recounts from scratch.
  */
 static int probe_existing(apply_ctx_t *a, const unsigned char *key,
                           apr_size_t keylen, unsigned char *origin)
@@ -319,10 +473,11 @@ static apr_status_t apply_one(void *ctx, int added,
     unsigned char key[CROWDSEC_KEY_MAX];
     apr_size_t keylen;
     decision_value_t val;
-    apr_time_t expires = apr_time_now() + d->duration;
+    apr_time_t now = apr_time_now();
+    apr_time_t expires;
     unsigned char oid, had_origin = CROWDSEC_ORIGIN_UNKNOWN;
     int ipt = net_ipt(&d->net);
-    int had = 0;
+    int had = 0, mine;
 
     if (++a->ops >= APPLY_CHUNK_OPS) {
         apr_status_t rv;
@@ -348,6 +503,32 @@ static apr_status_t apply_one(void *ctx, int added,
                                      d->origin[0] ? d->origin : "unknown");
 
     if (!added) {
+        /* Only this type is withdrawn. If the entry still carries another,
+         * it stays, with the expiry of what is left.
+         */
+        if (fetch_own(a, key, keylen, &val)) {
+            int i = slot_find(&val, d->type);
+
+            if (i >= 0) {
+                val.slot[i] = val.slot[--val.nslots];
+            }
+            slots_prune(&val, exp_to_sec(now));
+            if (val.nslots) {
+                if (i >= 0) {
+                    expires = slots_expiry(&val);
+                    a->sconf->cache_provider->store(a->sconf->cache_instance,
+                                                    a->s, key,
+                                                    (unsigned int) keylen,
+                                                    expires,
+                                                    (unsigned char *) &val,
+                                                    VALUE_LEN(val.nslots),
+                                                    a->p);
+                    sample_note(a, key, keylen, expires);
+                }
+                return APR_SUCCESS;
+            }
+        }
+
         /* The origin has to come out of the store before the entry does: the
          * stream says what to remove, not what it was attributed to.
          */
@@ -366,6 +547,17 @@ static apr_status_t apply_one(void *ctx, int added,
         had = probe_existing(a, key, keylen, &had_origin);
     }
 
+    mine = fetch_own(a, key, keylen, &val);
+    if (mine) {
+        had_origin = val.origin;
+    }
+    else {
+        val.nslots = 0;
+    }
+    slots_prune(&val, exp_to_sec(now));
+    slots_add(&val, d->type, exp_to_sec(now + d->duration));
+    expires = slots_expiry(&val);
+
     /* Every stream decision is a ban: a challenge from LAPI carries no
      * interstitial to serve and must fail closed, and captcha maps to ban
      * because this module does not implement captcha.
@@ -377,12 +569,24 @@ static apr_status_t apply_one(void *ctx, int added,
 
     if (a->sconf->cache_provider->store(a->sconf->cache_instance, a->s,
                                         key, (unsigned int) keylen, expires,
-                                        (unsigned char *) &val, sizeof(val),
+                                        (unsigned char *) &val,
+                                        VALUE_LEN(val.nslots),
                                         a->p) != APR_SUCCESS) {
         a->store_failures++;
         return APR_SUCCESS;     /* keep going; the count is reported after */
     }
     plen_set(d->net.family == 6 ? &a->plens6 : &a->plens4, d->net.plen);
+
+    if (a->full && mine) {
+        /* Another type for a network this pull already wrote: the same
+         * entry, so it is not counted again.
+         */
+        if (had_origin != oid) {
+            a->fresh_active[had_origin][ipt]--;
+            a->fresh_active[oid][ipt]++;
+        }
+        return APR_SUCCESS;
+    }
     a->stored++;
 
     if (a->full) {
@@ -881,6 +1085,7 @@ static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
     val.version = DECISION_VALUE_VERSION;
     val.rem = (unsigned char) rem;
     val.origin = origin;
+    val.nslots = 0;
 
     if (crowdsec_store_lock(sconf) != APR_SUCCESS) {
         return;
@@ -892,7 +1097,7 @@ static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
     sconf->cache_provider->store(sconf->cache_instance, r->server, key,
                                  (unsigned int) keylen,
                                  apr_time_now() + sconf->cache_timeout,
-                                 (unsigned char *) &val, sizeof(val),
+                                 (unsigned char *) &val, VALUE_LEN(0),
                                  r->pool);
     crowdsec_store_unlock(sconf);
 }

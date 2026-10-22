@@ -39,7 +39,17 @@ typedef struct
      * carries six figures of them. Empty when the field was absent.
      */
     char origin[CROWDSEC_ORIGIN_LEN];
+    /* The decision's type folded to a byte: ban and captcha get fixed ids,
+     * anything else a hash of its name. Every type is enforced as a ban, but
+     * LAPI keeps one decision per type for the same value and withdraws them
+     * separately, so the store has to tell them apart. A missing type reads
+     * as ban.
+     */
+    unsigned char type;
 } crowdsec_decision_t;
+
+#define CROWDSEC_DTYPE_BAN     1
+#define CROWDSEC_DTYPE_CAPTCHA 2
 
 /* Returning anything but APR_SUCCESS aborts the parse. */
 typedef apr_status_t (*crowdsec_decision_cb) (void *ctx, int added,

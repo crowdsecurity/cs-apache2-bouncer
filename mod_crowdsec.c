@@ -237,19 +237,35 @@ static int crowdsec_fallback(request_rec *r, crowdsec_config_rec *conf,
 /* Set on every request_rec where this module actually reached a verdict.
  * r->notes is per-request_rec - an internal redirect gets a fresh table - so
  * walking r->prev distinguishes "already checked" from "never checked".
+ *
+ * The value says which checks that verdict covered, as a digit of
+ * CHECKED_* bits. A redirect out of a scope with the local API only into one
+ * with AppSec has had no inspection, and inheriting the verdict whole let any
+ * rewrite into a WAF-protected location skip the WAF.
  */
 #define CROWDSEC_NOTE_DECIDED "crowdsec-decided"
 
+#define CHECKED_LAPI   1
+#define CHECKED_APPSEC 2
+
+static const char *const checked_note[] = { "0", "1", "2", "3" };
+
+/* -1 when nothing earlier in the chain was decided, otherwise the checks it
+ * covered between them. They all ran for the same client request.
+ */
 static int decided_earlier(request_rec *r)
 {
     request_rec *prev;
+    int checked = -1;
 
     for (prev = r->prev; prev; prev = prev->prev) {
-        if (apr_table_get(prev->notes, CROWDSEC_NOTE_DECIDED)) {
-            return 1;
+        const char *v = apr_table_get(prev->notes, CROWDSEC_NOTE_DECIDED);
+
+        if (v && v[0] >= '0' && v[0] <= '3') {
+            checked = (checked < 0 ? 0 : checked) | (v[0] - '0');
         }
     }
-    return 0;
+    return checked;
 }
 
 /* Resolved at the point of use, so an unset parent scope is not mistaken for
@@ -282,35 +298,28 @@ static int crowdsec_check_access(request_rec *r)
                                                      &crowdsec_module);
     crowdsec_server_rec *sconf = ap_get_module_config(r->server->module_config,
                                                       &crowdsec_module);
-    crowdsec_req_rec *st;
+    crowdsec_req_rec *st, *inherited = NULL;
     crowdsec_rem_t rem = CROWDSEC_REM_ALLOW;
     crowdsec_rem_t lapi_rem = CROWDSEC_REM_ALLOW;
     crowdsec_lookup_t lr;
     const char *ip;
     unsigned char origin = CROWDSEC_ORIGIN_UNKNOWN;
-    int appsec_on, challenge_path = 0, ipt;
+    int appsec_on, challenge_path = 0, ipt, need, checked = -1;
 
     /* A subrequest is covered by the main request. */
     if (r->main) {
         return DECLINED;
     }
-    /* An internal redirect inherits a verdict only if one was actually
-     * reached. A RewriteRule out of an unprotected scope into a protected one
-     * arrives here with r->prev set and nothing checked, so declining on
-     * r->prev alone would hand the target over unchecked. An ErrorDocument
-     * follows a request we did decide, so it still short-circuits here.
-     *
-     * The body is gone by this point, though: the original request consumed
-     * it. A redirect that does reach the checks below therefore inspects
-     * headers only - see the body handling in crowdsec_appsec_check.
+    /* An internal redirect inherits only the checks already run for this
+     * request. Whether they cover this scope is known once its gates are
+     * resolved below; an ErrorDocument in the same scope still short-circuits.
      */
-    if (r->prev && decided_earlier(r)) {
+    if (r->prev && (checked = decided_earlier(r)) >= 0) {
         /* The verdict carries over, but the body does not: the redirect lost
          * our input filter and HTTP_IN is already drained, so hand the
          * captured copy to this request's handler.
          */
-        crowdsec_appsec_inherit_body(r);
-        return DECLINED;
+        inherited = crowdsec_appsec_inherit_body(r);
     }
     if (!sconf) {
         return DECLINED;
@@ -361,13 +370,23 @@ static int crowdsec_check_access(request_rec *r)
         appsec_on = 0;
     }
 
+    need = (conf->enable && sconf->url ? CHECKED_LAPI : 0)
+        | (appsec_on ? CHECKED_APPSEC : 0);
+    if (checked >= 0) {
+        if (!(need & ~checked)) {
+            return DECLINED;
+        }
+        /* Only what is missing runs below. */
+        need &= ~checked;
+    }
+
     /* Past the enable gate, so this request really is being decided - by the
      * local API, by AppSec, or by the fallback below. Marking any earlier
      * would let a "Crowdsec off" scope claim a verdict it never reached, and
      * an internal redirect out of it would inherit that and skip its own
      * check.
      */
-    apr_table_setn(r->notes, CROWDSEC_NOTE_DECIDED, "1");
+    apr_table_setn(r->notes, CROWDSEC_NOTE_DECIDED, checked_note[need]);
 
     ip = crowdsec_client_ip(r, conf);
     if (!ip) {
@@ -377,17 +396,25 @@ static int crowdsec_check_access(request_rec *r)
 
     /* Counted here, where the request is certainly being decided, and counted
      * once: subrequests and internal redirects that inherit a verdict have
-     * already returned above, and a scope with nothing enabled never gets
-     * this far.
+     * already returned above, a redirect completing one counted it the first
+     * time, and a scope with nothing enabled never gets this far.
      */
-    crowdsec_metrics_processed(sconf, ipt);
+    if (checked < 0) {
+        crowdsec_metrics_processed(sconf, ipt);
+    }
 
-    st = apr_pcalloc(r->pool, sizeof(*st));
-    st->r = r;
-    ap_set_module_config(r->request_config, &crowdsec_module, st);
+    /* A body captured before the redirect stays this request's: its replay
+     * filter is already reading from it.
+     */
+    st = inherited;
+    if (!st) {
+        st = apr_pcalloc(r->pool, sizeof(*st));
+        st->r = r;
+        ap_set_module_config(r->request_config, &crowdsec_module, st);
+    }
 
     /* 1. The local API's view, from the stream cache or a live query. */
-    if (conf->enable && sconf->url) {
+    if (need & CHECKED_LAPI) {
         lr = crowdsec_lapi_lookup(r, sconf, ip, &rem, &origin);
         lapi_rem = rem;
         if (lr != CROWDSEC_LOOKUP_OK) {
@@ -415,7 +442,7 @@ static int crowdsec_check_access(request_rec *r)
     /* 2. Inspection, unless the verdict is already as restrictive as it can
      * get. Nothing is gained by inspecting a request that is already banned.
      */
-    if (appsec_on
+    if ((need & CHECKED_APPSEC)
         && (rem < CROWDSEC_REM_BAN
             || (conf->appsec_always_send_set && conf->appsec_always_send))) {
         switch (crowdsec_appsec_check(r, sconf, conf, st, ip)) {

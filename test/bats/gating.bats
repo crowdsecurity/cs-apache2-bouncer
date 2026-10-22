@@ -95,6 +95,49 @@ CONF
     [ "$output" = "guarded-ok" ]
 }
 
+# The same shape one level down: the source scope is checked against the local
+# API, the target also has AppSec. The note used to say only "decided", so the
+# redirect inherited a verdict that never involved the WAF.
+waf_redirect_conf() {
+    cat <<CONF
+$(stream_conf)
+CrowdsecAppsecURL http://127.0.0.1:$APPSEC_PORT
+Crowdsec On
+<Directory "$HARNESS_DIR/htdocs/open">
+    RewriteEngine On
+    RewriteRule ^jump\$ /guarded/index.html
+</Directory>
+<Location /guarded>
+    CrowdsecAppsec On
+</Location>
+CONF
+}
+
+@test "a redirect into an AppSec scope is inspected" {
+    appsec_start
+    appsec_set '{"action":"ban","http_status":403,"status":403}'
+    lapi_set "{\"decisions\":[$(decision 10.9.9.9 Ip)],\"sticky\":true}"
+    apache_start "$(waf_redirect_conf)"
+    wait_primed
+    [ "$(http_status guarded/index.html)" = 429 ]
+    # The bypass: same request, reached through a rewrite. Reset first, so
+    # what the stub saw can only come from the redirect.
+    appsec_set '{"action":"ban","http_status":403,"status":403}'
+    [ "$(http_status open/jump)" = 429 ]
+    # What the client sent, not what the rewrite mapped it to.
+    [ "$(appsec_seen uri)" = /open/jump ]
+}
+
+@test "a redirect into an AppSec scope still serves a clean request" {
+    appsec_start
+    lapi_set "{\"decisions\":[$(decision 10.9.9.9 Ip)],\"sticky\":true}"
+    apache_start "$(waf_redirect_conf)"
+    wait_primed
+    run curl -s --max-time 10 "http://127.0.0.1:$APACHE_PORT/open/jump"
+    [ "$output" = "guarded-ok" ]
+    [ "$(appsec_calls)" = 1 ]
+}
+
 @test "ErrorDocument still inherits the decision instead of looping" {
     # The block response is served through an internal redirect. The redirect
     # must reuse the verdict already reached, not re-enter the lookup, or a

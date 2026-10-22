@@ -434,6 +434,7 @@ crowdsec_appsec_res_t crowdsec_appsec_check(request_rec *r,
     long status = 0;
     char errbuf[256];
     apr_off_t cap;
+    request_rec *orig = r;
 
     if (!sconf->appsec_url || !sconf->curl_handles) {
         return CROWDSEC_APPSEC_FAIL;
@@ -443,8 +444,15 @@ crowdsec_appsec_res_t crowdsec_appsec_check(request_rec *r,
      * collapsed that, so sending it would hand the rule engine a normalised
      * path with the query string already gone - and the engine takes its
      * arguments from this header, not from the URL we connect to.
+     *
+     * And the one the client sent: after an internal redirect r is the
+     * rewrite's target, and a rule in front of an application has to see the
+     * path it was attacked on, not the file a RewriteRule mapped it to.
      */
-    target = r->unparsed_uri;
+    while (orig->prev) {
+        orig = orig->prev;
+    }
+    target = orig->unparsed_uri;
     if (!target || target[0] != '/') {
         /* An absolute-form target cannot be forwarded honestly: trimming it
          * loses the authority, and passing it whole makes the engine's idea of

@@ -15,6 +15,11 @@
 
 #include "crowdsec_poison.h"
 
+/* AP_DECLARE_MODULE tags mod_crowdsec.c only; without this, lines logged
+ * here show as [:level] and "LogLevel crowdsec:..." does not reach them.
+ */
+APLOG_USE_MODULE(crowdsec);
+
 /* The control headers. The engine strips all of these before the request
  * reaches the rule engine, so forwarding the client's own headers underneath
  * them is safe.

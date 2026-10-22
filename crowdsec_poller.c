@@ -24,6 +24,11 @@
 #include "crowdsec_poison.h"
 #include "crowdsec_store.h"
 
+/* AP_DECLARE_MODULE tags mod_crowdsec.c only; without this, lines logged
+ * here show as [:level] and "LogLevel crowdsec:..." does not reach them.
+ */
+APLOG_USE_MODULE(crowdsec);
+
 /* ------------------------------------------------------------- the poller */
 
 /* Every child runs a poller thread and they agree on one leader through this

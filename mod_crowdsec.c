@@ -310,14 +310,9 @@ static int crowdsec_check_access(request_rec *r)
     if (r->main) {
         return DECLINED;
     }
-    /* An internal redirect inherits a verdict only for the checks that were
-     * actually run. A RewriteRule out of an unprotected scope into a protected
-     * one arrives here with r->prev set and nothing checked, so declining on
-     * r->prev alone would hand the target over unchecked; one out of a scope
-     * without AppSec into one with it would skip the inspection. Whether the
-     * earlier checks cover this scope is known only once its own gates are
-     * resolved below. An ErrorDocument follows a request we did decide, in a
-     * scope needing no more than that one, so it still short-circuits.
+    /* An internal redirect inherits only the checks already run for this
+     * request. Whether they cover this scope is known once its gates are
+     * resolved below; an ErrorDocument in the same scope still short-circuits.
      */
     if (r->prev && (checked = decided_earlier(r)) >= 0) {
         /* The verdict carries over, but the body does not: the redirect lost

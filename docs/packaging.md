@@ -91,7 +91,7 @@ Three traps when writing tests like this by hand:
 ### Prereleases, for testing packages
 
 Tag `vX.Y.Z-rcN`. The package version becomes `X.Y.Z~rcN`, and the GitHub
-release is marked as a prerelease.
+release is drafted and marked as a prerelease, for you to write up and publish.
 
 The `-rc` → `~rc` rewrite is not cosmetic and it is not optional:
 
@@ -134,7 +134,16 @@ gate comparing the full string fails every prerelease build.
 2. Tag `vX.Y.Z`, or `vX.Y.Z-rcN` for a prerelease.
 3. `.github/workflows/release.yml` derives the package version from the tag,
    checks its upstream part against `configure.ac`, builds every target for
-   both architectures, and attaches the packages to a GitHub release.
+   both architectures, and attaches the packages to a **draft** GitHub
+   release.
+4. Write the changelog on that draft - the release editor's "Generate release
+   notes" button seeds one - and publish it.
+
+The workflow deliberately stops at a draft. Publishing is the step that fires
+the packagecloud webhook, so it stays a human decision taken once the packages
+are attached and the notes are right; and because the workflow passes no
+`body`, a re-run never overwrites what was written by hand.
+
 ### What a release contains
 
 One asset per target and architecture. The deb filenames carry the codename
@@ -173,9 +182,23 @@ asset for their distro and install it with `apt install ./...deb` or
 
 Nothing in this repo pushes to packagecloud, and it should stay that way:
 publishing a GitHub release fires the webhook that starts this product's AWS
-CodePipeline, defined in `crowdsecurity/packaging`, which signs and pushes to
-`crowdsec/crowdsec-apache` (release) or `crowdsec/crowdsec-apache-testing`
-(prerelease).
+CodePipeline, which signs and pushes to `crowdsec/crowdsec-apache` (release)
+or `crowdsec/crowdsec-apache-testing` (prerelease). The webhook handler is
+`packaging/src/webhook/webhook.py` in `crowdsecurity/terraform-infra`; it acts
+on the `prereleased` and `released` actions only, and the repository branch it
+feeds is the `APACHE_BOUNCER` gate in
+`crowdsecurity/packaging:codepipeline/update_repository/update_deb/script.sh`.
+
+That webhook is **currently disabled** on this repository (hook `526124629`,
+set `active=false` on 2026-10-22) so that release testing cannot reach
+packagecloud. Re-enable it only once the lane below is fixed:
+
+```sh
+gh api -X PATCH repos/crowdsecurity/cs-apache2-bouncer/hooks/526124629 -F active=true
+```
+
+Nothing in `terraform-infra` declares a `github_repository_webhook`, so a
+`terraform apply` will neither revert nor restore that state.
 
 That lane is **not ready for these packages yet**, which is why releases are
 the channel for now. Two hard blockers and one correctness bug, detailed

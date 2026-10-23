@@ -773,11 +773,12 @@ const command_rec crowdsec_cmds[] = {
     AP_INIT_TAKE1("CrowdsecCache", set_crowdsec_cache, NULL, RSRC_CONF,
                   "Shared cache for decisions, e.g. shmcb or "
                   "shmcb:crowdsec(16777216). Required by stream mode, where it "
-                  "must hold every decision. Measured: 100000 decisions need "
-                  "at least 6MB and 1000000 fit in 128MB, so budget about 128 "
-                  "bytes per decision for headroom. Too small and decisions "
-                  "are silently evicted, leaving those clients unblocked; the "
-                  "error log reports it after each pull."),
+                  "must hold every decision. Budget about 128 bytes per "
+                  "decision: 16MB is the recommended floor "
+                  "and covers about 100k decisions, 1M wants 128MB. "
+                  "Too small and decisions are silently evicted, leaving "
+                  "those clients unblocked; the error log reports it after "
+                  "each pull."),
     AP_INIT_FLAG("CrowdsecMetrics", set_crowdsec_metrics, NULL, RSRC_CONF,
                  "Whether to report usage metrics to the local API's "
                  "/v1/usage-metrics, which is what cscli metrics show "

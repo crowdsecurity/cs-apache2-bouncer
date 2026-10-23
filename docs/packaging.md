@@ -174,6 +174,37 @@ Renaming the file is safe: dpkg and rpm both read the package's own metadata,
 not its filename, so `apt install ./crowdsec-apache2-bouncer_1.0.0_noble_amd64.deb`
 behaves exactly as before.
 
+### A prerelease asset's filename is not its version
+
+GitHub does not allow `~` in a release asset name and rewrites it to `.`, so
+the assets of a prerelease are served as `1.0.0.rc1`, not `1.0.0~rc1`:
+
+```
+crowdsec-apache2-bouncer_1.0.0.rc1_noble_amd64.deb      # on the release page
+crowdsec-apache2-bouncer-1.0.0.rc1-1.el9.x86_64.rpm
+```
+
+This is cosmetic. The packages themselves still declare `1.0.0~rc1`, and both
+package managers order by that, so the rc still sorts below the release -
+measured on the published artifacts:
+
+```
+dpkg: installing 1.0.0 over the rc is "1 upgraded"; going back warns
+      "downgrading crowdsec-apache2-bouncer from 1.0.0 to 1.0.0~rc1"
+rpm:  vercmp("1.0.0~rc1", "1.0.0") = -1
+```
+
+**Never derive a version from these filenames.** `1.0.0.rc1` read as a version
+sorts *above* `1.0.0` (`dpkg --compare-versions 1.0.0.rc1 lt 1.0.0` is false),
+which is the opposite of what the package means - and there is no filename
+that is both acceptable to GitHub and correctly sortable, since `~` is the only
+prefix that sorts low. Read `dpkg-deb -f ... Version` or `rpm -qp --qf
+%{VERSION}` instead.
+
+Note this does not affect the `check what we are about to publish` step in
+`release.yml`: it runs on the downloaded build artifacts, whose names still
+carry the tilde, before anything is uploaded.
+
 ## Distribution
 
 **Today the GitHub release is the distribution channel.** Users download the

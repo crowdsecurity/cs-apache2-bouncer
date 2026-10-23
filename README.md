@@ -225,7 +225,7 @@ Scope column: **S** = server/vhost only, **S+D** = also valid in
 | `CrowdsecAPIKey` | S | — | Bouncer key from `cscli bouncers add`. |
 | `CrowdsecMode` | S | `live` | `live` or `stream`. `stream` requires `CrowdsecCache`. Servers sharing a cache must agree on the mode; a mismatch is refused at startup. |
 | `CrowdsecUpdateFrequency` | S | `10s` | Decision stream poll interval. |
-| `CrowdsecCache` | S | — | Shared decision cache, e.g. `shmcb:crowdsec(16777216)`. Main server only; vhosts inherit it. Required by stream mode. Budget ~128 bytes per decision: 100,000 decisions need at least 6 MB, 1,000,000 fit in 128 MB. Undersized, decisions are evicted and those clients go unblocked; the error log reports it after each pull. |
+| `CrowdsecCache` | S | — | Shared decision cache, e.g. `shmcb:crowdsec(16777216)`. Main server only; vhosts inherit it. Required by stream mode. Budget ~128 bytes per decision, generous on purpose so uneven bucket distribution cannot evict early: `shmcb:crowdsec(16777216)` is the recommended floor and covers ~100,000 decisions, 1,000,000 wants 128 MB. Undersized, decisions are evicted and those clients go unblocked; the error log reports it after each pull. |
 | `CrowdsecCacheTimeout` | S | `60s` | How long one address's verdict is held in the **shared** cache. Live mode only: it is what stops every child querying the API for the same client. |
 | `CrowdsecLocalCacheTimeout` | S | `2s` | How long one address's verdict is held **within a single Apache child**, in front of the shared cache. Added to `CrowdsecUpdateFrequency` in the time a new decision takes to apply, so keep it small. Capped at `CrowdsecCacheTimeout`. |
 | `CrowdsecConnectTimeout` | S | `1s` | Connection timeout to the local API. |
@@ -331,10 +331,13 @@ for ~3%. Tune the rule set, not the bouncer.
 **The challenge interstitial is ~327 KB per unsolved visitor.** On a public
 site this is a bandwidth consideration before it is a CPU one.
 
-**An internal redirect is inspected headers-only.** A request reaching a
-protected scope through `mod_rewrite` or `ErrorDocument` has already had its
-body consumed, so only its headers and URI go to AppSec. The decision lookup
-still applies in full.
+**An internal redirect is inspected against the URI the client asked for**,
+not the rewritten target, and inspected once: a redirect never re-runs a check
+its source scope already ran. A `mod_rewrite` rule into a protected scope is
+inspected in full, body included. The exception is an error document in a
+protected scope reached from an error Apache raised itself - a 404, say - where
+Apache has already discarded the body, so only the headers and URI go to AppSec
+and the method reads as `GET`.
 
 **`CrowdsecLocation` is untested.** It works as described but has no automated
 coverage.

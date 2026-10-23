@@ -637,7 +637,6 @@ static int crowdsec_post_config(apr_pool_t *pconf, apr_pool_t *plog,
                                 apr_pool_t *ptmp, server_rec *s)
 {
     server_rec *s_vhost;
-    int remoteip_loaded = ap_find_linked_module("mod_remoteip.c") != NULL;
 
     /* avg_id_len is 18: our longest key is family + prefix + 16 address bytes.
      * avg_obj_size is 32, comfortably over the 5-byte decision value, so the
@@ -723,18 +722,6 @@ static int crowdsec_post_config(apr_pool_t *pconf, apr_pool_t *plog,
                           "failed to create the %s metrics region",
                           crowdsec_id);
             return 500;
-        }
-
-        if (remoteip_loaded) {
-            /* mod_remoteip's trusted-proxy list is private to it, so a notice
-             * is all we can offer: with RemoteIPHeader set and no trusted
-             * list, any client can choose the address we police.
-             */
-            ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, s_vhost,
-                         "crowdsec: mod_remoteip is loaded and this module "
-                         "trusts the address it reports; make sure "
-                         "RemoteIPTrustedProxy or RemoteIPInternalProxy is "
-                         "set, or use CrowdsecTrustUseragentIP off");
         }
     }
 

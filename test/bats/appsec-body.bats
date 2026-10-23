@@ -74,6 +74,54 @@ post_echo() {
     [[ "$output" == *"md5=$want"* ]]
 }
 
+@test "a POST rewritten into an AppSec scope is inspected with its body" {
+    # The docs used to claim an internal redirect is inspected headers-only.
+    # It is not: the redirect is a fresh request_rec, nothing decided on the
+    # first one here, so the full check runs and HTTP_IN is still readable.
+    # Only an error document reached from an error Apache raised itself loses
+    # the body, because Apache discards it before ap_die.
+    appsec_set '{"action":"allow","http_status":200}'
+    apache_start "$(body_conf "
+CrowdsecAppsec Off
+<Directory \"$HARNESS_DIR/htdocs/open\">
+    RewriteEngine On
+    RewriteRule ^jump\$ /guarded/index.html
+</Directory>
+<Location /guarded>
+    CrowdsecAppsec On
+</Location>")"
+    run curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST \
+        --data-binary 'aaaaaaaaaaaaaaaaaaaa' \
+        "http://127.0.0.1:$APACHE_PORT/open/jump"
+    [ "$output" = 200 ]
+    [ "$(appsec_calls)" = 1 ]
+    [ "$(appsec_seen body_len)" = 20 ]
+    # What the client sent, not what the rewrite mapped it to.
+    [ "$(appsec_seen uri)" = /open/jump ]
+    [ "$(appsec_seen verb)" = POST ]
+}
+
+@test "an error document in an AppSec scope is inspected headers-only" {
+    # Apache discards the body before ap_die, so the error document's request
+    # has none to forward - and httpd has already forced the method to GET.
+    # This is the one case the "headers-only" wording was right about.
+    appsec_set '{"action":"allow","http_status":200}'
+    apache_start "$(body_conf "
+CrowdsecAppsec Off
+ErrorDocument 404 /guarded/index.html
+<Location /guarded>
+    CrowdsecAppsec On
+</Location>")"
+    run curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST \
+        --data-binary 'aaaaaaaaaaaaaaaaaaaa' \
+        "http://127.0.0.1:$APACHE_PORT/does-not-exist"
+    [ "$output" = 404 ]
+    [ "$(appsec_calls)" = 1 ]
+    [ "$(appsec_seen body_len)" = 0 ]
+    [ "$(appsec_seen uri)" = /does-not-exist ]
+    [ "$(appsec_seen verb)" = GET ]
+}
+
 @test "a small body is inspected and still reaches the handler intact" {
     # This is the one that breaks PHP if it is wrong: we consume the body to
     # inspect it, so it has to be put back.

@@ -330,9 +330,11 @@ static const char *parse_interval(cmd_parms *cmd, const char *arg,
 {
     apr_interval_time_t t;
 
-    if (ap_timeout_parameter_parse(arg, &t, "s") != APR_SUCCESS) {
+    /* combine apache and crowdsec duration parsers */
+    if (ap_timeout_parameter_parse(arg, &t, "s") != APR_SUCCESS
+        && !crowdsec_parse_duration(arg, &t)) {
         return apr_psprintf(cmd->pool, "%s '%s' is not a valid duration. Use "
-                            "e.g. 200ms, 5s or 2min.", name, arg);
+                            "e.g. 200ms, 5s, 2min or 15m.", name, arg);
     }
     if (t <= 0) {
         return apr_psprintf(cmd->pool, "%s must be greater than zero.", name);
@@ -771,11 +773,12 @@ const command_rec crowdsec_cmds[] = {
     AP_INIT_TAKE1("CrowdsecCache", set_crowdsec_cache, NULL, RSRC_CONF,
                   "Shared cache for decisions, e.g. shmcb or "
                   "shmcb:crowdsec(16777216). Required by stream mode, where it "
-                  "must hold every decision. Measured: 100000 decisions need "
-                  "at least 6MB and 1000000 fit in 128MB, so budget about 128 "
-                  "bytes per decision for headroom. Too small and decisions "
-                  "are silently evicted, leaving those clients unblocked; the "
-                  "error log reports it after each pull."),
+                  "must hold every decision. Budget about 128 bytes per "
+                  "decision: 16MB is the recommended floor "
+                  "and covers about 100k decisions, 1M wants 128MB. "
+                  "Too small and decisions are silently evicted, leaving "
+                  "those clients unblocked; the error log reports it after "
+                  "each pull."),
     AP_INIT_FLAG("CrowdsecMetrics", set_crowdsec_metrics, NULL, RSRC_CONF,
                  "Whether to report usage metrics to the local API's "
                  "/v1/usage-metrics, which is what cscli metrics show "

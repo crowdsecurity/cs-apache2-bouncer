@@ -115,6 +115,19 @@ if [ "$START" -eq 0 ]; then
     echo "no api key was generated; run 'cscli bouncers add <bouncer_name>' on your LAPI server and put the key in /etc/crowdsec/bouncers/%{name}.conf" >&2
 fi
 
+# A default RHEL policy denies httpd_t any outbound connection, so every lookup
+# fails and CrowdsecFallback allow turns that into a silent allow-all. Nothing
+# is written to the audit log for it, so the only hint is one libcurl error in
+# the httpd error log - say it here instead. Not set automatically: a
+# system-wide SELinux boolean is the administrator's call, not a package's.
+if [ "$(getenforce 2>/dev/null)" = "Enforcing" ] && command -v getsebool >/dev/null 2>&1; then
+    case "$(getsebool httpd_can_network_connect 2>/dev/null)" in
+    *off)
+        echo "SELinux is enforcing and httpd_can_network_connect is off, so httpd cannot reach the local API or the AppSec component and every request will be allowed. Run 'setsebool -P httpd_can_network_connect on'." >&2
+        ;;
+    esac
+fi
+
 # Test before reloading: a bad Crowdsec directive must not take httpd down
 # during a package install.
 if /usr/sbin/apachectl configtest >/dev/null 2>&1; then

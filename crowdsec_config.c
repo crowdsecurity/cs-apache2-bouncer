@@ -330,9 +330,11 @@ static const char *parse_interval(cmd_parms *cmd, const char *arg,
 {
     apr_interval_time_t t;
 
-    if (ap_timeout_parameter_parse(arg, &t, "s") != APR_SUCCESS) {
+    /* combine apache and crowdsec duration parsers */
+    if (ap_timeout_parameter_parse(arg, &t, "s") != APR_SUCCESS
+        && !crowdsec_parse_duration(arg, &t)) {
         return apr_psprintf(cmd->pool, "%s '%s' is not a valid duration. Use "
-                            "e.g. 200ms, 5s or 2min.", name, arg);
+                            "e.g. 200ms, 5s, 2min or 15m.", name, arg);
     }
     if (t <= 0) {
         return apr_psprintf(cmd->pool, "%s must be greater than zero.", name);

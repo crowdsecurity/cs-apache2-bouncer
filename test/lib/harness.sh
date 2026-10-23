@@ -298,6 +298,15 @@ decision() {
         "${3:-1h0m0s}" "$2" "$1"
 }
 
+# decision_typed <value> <scope> <type> [duration] [id]
+# Like decision(), but with another type, and an id of its own: the store tells
+# decisions for the same network apart by id, so a test with several needs
+# them to differ.
+decision_typed() {
+    printf '{"duration":"%s","id":%s,"origin":"cscli","scenario":"manual","scope":"%s","type":"%s","value":"%s"}' \
+        "${4:-1h0m0s}" "${5:-1}" "$2" "$3" "$1"
+}
+
 # decision_from <value> <scope> <origin> [scenario] [duration]
 # Like decision(), but with the origin the metrics attribute the block to. A
 # blocklist decision is origin "lists" plus the list name in scenario.

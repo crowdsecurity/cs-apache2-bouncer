@@ -252,6 +252,14 @@ static apr_status_t do_pull(server_rec *s, crowdsec_server_rec *sconf,
  */
 #define POLLER_POOL_MAX_FREE (4 * 1024 * 1024)
 
+/* The longest the store goes without a full pull. An incremental pull cannot
+ * restore a decision the store dropped - one shadowed by a longer decision for
+ * the same network when that one is removed, or one the cache force-expired -
+ * and only a full snapshot carries it again. With metrics on, the reporting
+ * thread already asks for one per window; this covers metrics off.
+ */
+#define POLLER_RESYNC_EVERY apr_time_from_sec(900)
+
 static void *APR_THREAD_FUNC poller_main(apr_thread_t *thd, void *data)
 {
     crowdsec_server_rec *sconf = data;
@@ -261,6 +269,7 @@ static void *APR_THREAD_FUNC poller_main(apr_thread_t *thd, void *data)
     int was_leader = 0;
     int need_full = 1;
     apr_time_t last_pull = 0;   /* 0 so the first wake pulls immediately */
+    apr_time_t last_full = 0;
 
     /* Our own bounded allocator, not the thread pool's: that one is shared up
      * the pool tree and never returns freed memory to the OS, so the parse
@@ -320,11 +329,15 @@ static void *APR_THREAD_FUNC poller_main(apr_thread_t *thd, void *data)
              * here rather than when it is set, so the request is only consumed
              * by a pull that is actually about to happen.
              */
-            if (crowdsec_metrics_resync_take(sconf)) {
+            if (crowdsec_metrics_resync_take(sconf)
+                || apr_time_now() - last_full >= POLLER_RESYNC_EVERY) {
                 need_full = 1;
             }
             apr_pool_create(&ptemp, tpool);
             if (do_pull(s, sconf, need_full, ptemp) == APR_SUCCESS) {
+                if (need_full) {
+                    last_full = apr_time_now();
+                }
                 need_full = 0;
             }
             else {

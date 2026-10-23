@@ -58,22 +58,22 @@ apr_status_t crowdsec_meta_create(apr_pool_t *pconf,
     return APR_SUCCESS;
 }
 
-#define DECISION_VALUE_VERSION 2
+#define DECISION_VALUE_VERSION 4
 
-/* Five bytes per decision. Shmcb's own per-entry overhead dominates either
- * way - the directive docs budget ~128 bytes per decision - so the sizing
- * guidance does not move.
+/* Seventeen bytes per decision. Shmcb's own per-entry overhead dominates
+ * either way - the directive docs budget ~128 bytes per decision - so the
+ * sizing guidance does not move.
  *
- * The generation is split into two bytes rather than declared apr_uint16_t so
+ * Multi-byte fields are split into bytes rather than declared as integers so
  * the struct has no padding: it is memcpy'd into the socache whole, and
  * padding would be an uninitialised read on every store.
  *
- * Adding it is what bumps the version, because the layout changed and a
- * four-byte value read as five would be nonsense. That costs nothing in
- * practice: the socache and this control region are created together in
- * post_config and recreated together on a restart, so values from an older
- * layout never coexist with this code. It does mean a version mismatch must
- * read as a miss, and in stream mode a miss means the client is not blocked.
+ * Any change to the layout bumps the version, because a value written by
+ * another layout would be read as nonsense. That costs nothing in practice:
+ * the socache and this control region are created together in post_config and
+ * recreated together on a restart, so values from an older layout never
+ * coexist with this code. It does mean a version mismatch must read as a
+ * miss, and in stream mode a miss means the client is not blocked.
  */
 typedef struct
 {
@@ -82,6 +82,21 @@ typedef struct
     unsigned char origin;       /* slot id in the shared metrics table */
     unsigned char gen_hi;
     unsigned char gen_lo;
+    /* There is one entry per network, but the engine can hold several
+     * decisions for it - a local ban for an address the community blocklist
+     * also carries, say. All of them are enforced as a ban, so the entry holds
+     * whichever lasts longest, and records which one that is: exp is when it
+     * ends, in seconds since the epoch, and id is the engine's id for it, both
+     * big-endian. The socache keeps its own expiry but will not tell us.
+     *
+     * The id is what makes removals safe. When a shorter decision for the
+     * network ends, the stream reports it as deleted, and without the id that
+     * removal would take out the entry holding the longer one. The expiry
+     * cannot stand in for it: the engine reports a decision deleted by hand
+     * with an elapsed duration, the same as one that ran out.
+     */
+    unsigned char exp[4];
+    unsigned char id[8];
 } decision_value_t;
 
 /* Hands out the next generation, skipping 0 - see crowdsec_meta. Caller holds
@@ -102,12 +117,17 @@ static void gen_put(decision_value_t *v, apr_uint16_t g)
     v->gen_lo = (unsigned char) (g & 0xffu);
 }
 
+static apr_uint16_t gen_get(const decision_value_t *v)
+{
+    return (apr_uint16_t) ((v->gen_hi << 8) | v->gen_lo);
+}
+
 /* Whether this value belongs to the snapshot in force. Caller holds the lock,
  * which every reader of meta already does.
  */
 static int gen_ok(const crowdsec_server_rec *sconf, const decision_value_t *v)
 {
-    apr_uint16_t g = (apr_uint16_t) ((v->gen_hi << 8) | v->gen_lo);
+    apr_uint16_t g = gen_get(v);
 
     return g == sconf->meta->gen
         || (sconf->meta->gen_applying && g == sconf->meta->gen_applying);
@@ -121,6 +141,55 @@ static int value_ok(const crowdsec_server_rec *sconf,
 {
     return vlen == sizeof(*v) && v->version == DECISION_VALUE_VERSION
         && gen_ok(sconf, v);
+}
+
+/* Whole seconds, rounded up so a decision never ends early. Durations are
+ * capped at ten years, so this fits until 2096.
+ */
+static apr_uint32_t exp_sec(apr_time_t t)
+{
+    apr_time_t sec = apr_time_sec(t + APR_USEC_PER_SEC - 1);
+
+    return sec <= 0 ? 0
+        : sec > (apr_time_t) 0xffffffffu ? 0xffffffffu : (apr_uint32_t) sec;
+}
+
+static void exp_put(decision_value_t *v, apr_uint32_t e)
+{
+    v->exp[0] = (unsigned char) (e >> 24);
+    v->exp[1] = (unsigned char) (e >> 16);
+    v->exp[2] = (unsigned char) (e >> 8);
+    v->exp[3] = (unsigned char) e;
+}
+
+static apr_uint32_t exp_get(const decision_value_t *v)
+{
+    return ((apr_uint32_t) v->exp[0] << 24)
+        | ((apr_uint32_t) v->exp[1] << 16)
+        | ((apr_uint32_t) v->exp[2] << 8)
+        | (apr_uint32_t) v->exp[3];
+}
+
+static void id_put(decision_value_t *v, apr_int64_t id)
+{
+    apr_uint64_t u = (apr_uint64_t) id;
+    int i;
+
+    for (i = 7; i >= 0; i--) {
+        v->id[i] = (unsigned char) (u & 0xffu);
+        u >>= 8;
+    }
+}
+
+static apr_int64_t id_get(const decision_value_t *v)
+{
+    apr_uint64_t u = 0;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        u = (u << 8) | v->id[i];
+    }
+    return (apr_int64_t) u;
 }
 
 /* Which array a family's counters live in. */
@@ -207,7 +276,24 @@ typedef struct
     unsigned int full:1;
     apr_uint16_t gen;           /* generation this batch writes */
     apr_uint32_t fresh_active[CROWDSEC_ORIGIN_MAX][CROWDSEC_IPT_MAX];
+    /* Full pull only: what this pull has written so far, by key, so that a
+     * second decision for a network can be compared with the first without a
+     * socache read for every one of six figures of decisions. The store from
+     * before the pull is no help there anyway - it belongs to the snapshot
+     * being replaced, whose decisions may have been withdrawn since.
+     */
+    apr_hash_t *written;
 } apply_ctx_t;
+
+/* One entry of apply_ctx_t.written. The key is copied in alongside, because
+ * the caller's buffer does not outlive the call.
+ */
+typedef struct
+{
+    unsigned char key[CROWDSEC_KEY_MAX];
+    apr_uint32_t exp;
+    unsigned char origin;
+} written_t;
 
 /* Releases and retakes the lock so request lookups can interleave with a
  * large batch. The lease is re-checked on the way back in - the pre-batch
@@ -234,31 +320,22 @@ static apr_status_t apply_yield(apply_ctx_t *a)
     return APR_SUCCESS;
 }
 
-/* Whether this key is already in the store, and under which origin. Only ever
- * asked to keep the active_decisions gauge straight, so it is skipped when
- * there is no gauge and on a full pull, which recounts from scratch: either
- * way the answer goes unused, and on a full pull it would be six figures of
- * extra socache reads under the global lock.
+/* The entry this key holds in the snapshot in force, if any. One read serves
+ * everything an incremental batch needs to know about it: whether it exists,
+ * for the active_decisions gauge; which origin it is attributed to, for the
+ * same; and which decision it holds and until when, to decide whether a new
+ * decision replaces it and whether a removal is aimed at it.
  */
-static int probe_existing(apply_ctx_t *a, const unsigned char *key,
-                          apr_size_t keylen, unsigned char *origin)
+static int read_entry(apply_ctx_t *a, const unsigned char *key,
+                      apr_size_t keylen, decision_value_t *out)
 {
-    decision_value_t old;
-    unsigned int olen = sizeof(old);
+    unsigned int olen = sizeof(*out);
 
-    if (!a->sconf->metrics) {
-        return 0;
-    }
-    if (a->sconf->cache_provider->retrieve(a->sconf->cache_instance, a->s, key,
-                                           (unsigned int) keylen,
-                                           (unsigned char *) &old, &olen,
-                                           a->p) != APR_SUCCESS
-        || !value_ok(a->sconf, &old, olen)) {
-        return 0;
-    }
-    *origin = old.origin;
-
-    return 1;
+    return a->sconf->cache_provider->retrieve(a->sconf->cache_instance, a->s,
+                                              key, (unsigned int) keylen,
+                                              (unsigned char *) out, &olen,
+                                              a->p) == APR_SUCCESS
+        && value_ok(a->sconf, out, olen);
 }
 
 /* The slot tracking this key, or -1. Caller holds the lock. */
@@ -317,17 +394,51 @@ static void sample_forget(apply_ctx_t *a, const unsigned char *key,
     }
 }
 
+/* A removal from the stream. The entry for a network holds only the
+ * longest-lasting of its decisions, so a removal of any other one - a shorter
+ * ban running out while a blocklist still carries the address - must leave it
+ * alone. Without an id on either side there is nothing to compare, and the
+ * entry goes.
+ *
+ * Removing the decision the entry does hold leaves the network unblocked even
+ * if a shorter decision for it is still running, because that one was never
+ * stored. The next full pull puts it back.
+ */
+static void apply_removal(apply_ctx_t *a, const crowdsec_decision_t *d,
+                          const unsigned char *key, apr_size_t keylen)
+{
+    decision_value_t old;
+    int had = read_entry(a, key, keylen, &old);
+
+    if (had && d->id && id_get(&old) && id_get(&old) != d->id) {
+        return;
+    }
+    /* A removal for something we never had is not an error. */
+    a->sconf->cache_provider->remove(a->sconf->cache_instance, a->s,
+                                     key, (unsigned int) keylen, a->p);
+    sample_forget(a, key, keylen);
+    if (had) {
+        /* The stream says what to remove, not what it was attributed to, so
+         * the origin comes from the store.
+         */
+        crowdsec_metrics_active_add(a->sconf, net_ipt(&d->net), old.origin,
+                                    -1);
+    }
+}
+
 static apr_status_t apply_one(void *ctx, int added,
                               const crowdsec_decision_t *d)
 {
     apply_ctx_t *a = ctx;
     unsigned char key[CROWDSEC_KEY_MAX];
     apr_size_t keylen;
-    decision_value_t val;
+    decision_value_t val, old;
     apr_time_t expires = apr_time_now() + d->duration;
-    unsigned char oid, had_origin = CROWDSEC_ORIGIN_UNKNOWN;
+    apr_uint32_t exp = exp_sec(expires);
+    unsigned char oid;
     int ipt = net_ipt(&d->net);
     int had = 0;
+    written_t *w = NULL;
 
     if (++a->ops >= APPLY_CHUNK_OPS) {
         apr_status_t rv;
@@ -344,6 +455,33 @@ static apr_status_t apply_one(void *ctx, int added,
         return APR_SUCCESS;     /* cannot happen; counted as a no-op if it does */
     }
 
+    if (!added) {
+        apply_removal(a, d, key, keylen);
+        return APR_SUCCESS;
+    }
+
+    /* Several decisions for one network all enforce the same ban, so the one
+     * that lasts longest is kept; see decision_value_t. A tie goes to the
+     * newcomer, which is what keeps a blocklist refresh - the same addresses
+     * re-issued under new ids - from leaving entries that its removal of the
+     * old ids would then take out.
+     *
+     * A full pull compares only with what it has itself written: the store
+     * from before it belongs to the snapshot being replaced.
+     */
+    if (a->full) {
+        w = apr_hash_get(a->written, key, (apr_ssize_t) keylen);
+        if (w && w->exp > exp) {
+            return APR_SUCCESS;
+        }
+    }
+    else {
+        had = read_entry(a, key, keylen, &old);
+        if (had && exp_get(&old) > exp) {
+            return APR_SUCCESS;
+        }
+    }
+
     /* Interning may take the metrics mutex, and we are holding the cache's.
      * That nesting is only ever in this direction - the metrics code never
      * touches the socache - so there is no cycle to deadlock on. It also only
@@ -351,25 +489,6 @@ static apr_status_t apply_one(void *ctx, int added,
      */
     oid = crowdsec_metrics_origin_id(a->sconf,
                                      d->origin[0] ? d->origin : "unknown");
-
-    if (!added) {
-        /* The origin has to come out of the store before the entry does: the
-         * stream says what to remove, not what it was attributed to.
-         */
-        had = probe_existing(a, key, keylen, &had_origin);
-        /* A removal for something we never had is not an error. */
-        a->sconf->cache_provider->remove(a->sconf->cache_instance, a->s,
-                                         key, (unsigned int) keylen, a->p);
-        sample_forget(a, key, keylen);
-        if (had) {
-            crowdsec_metrics_active_add(a->sconf, ipt, had_origin, -1);
-        }
-        return APR_SUCCESS;
-    }
-
-    if (!a->full) {
-        had = probe_existing(a, key, keylen, &had_origin);
-    }
 
     /* Every stream decision is a ban: a challenge from LAPI carries no
      * interstitial to serve and must fail closed, and captcha maps to ban
@@ -379,29 +498,61 @@ static apr_status_t apply_one(void *ctx, int added,
     val.rem = (unsigned char) CROWDSEC_REM_BAN;
     val.origin = oid;
     gen_put(&val, a->gen);
+    exp_put(&val, exp);
+    id_put(&val, d->id);
 
     if (a->sconf->cache_provider->store(a->sconf->cache_instance, a->s,
                                         key, (unsigned int) keylen, expires,
                                         (unsigned char *) &val, sizeof(val),
                                         a->p) != APR_SUCCESS) {
         a->store_failures++;
+        if (w) {
+            /* Replacing an entry this pull wrote. Whether the cache kept the
+             * old value is unknown, so count it as gone rather than leave the
+             * gauge claiming it.
+             */
+            a->fresh_active[w->origin][ipt]--;
+            a->stored--;
+            apr_hash_set(a->written, w->key, (apr_ssize_t) keylen, NULL);
+        }
         return APR_SUCCESS;     /* keep going; the count is reported after */
     }
     plen_set(d->net.family == 6 ? &a->plens6 : &a->plens4, d->net.plen);
+
+    if (w) {
+        /* A longer decision for a network this pull already wrote: the same
+         * entry, so it is not counted again, only re-attributed. A sample
+         * tracking it must follow the new expiry, or it would stop looking
+         * when the shorter decision would have ended.
+         */
+        a->fresh_active[w->origin][ipt]--;
+        a->fresh_active[oid][ipt]++;
+        w->exp = exp;
+        w->origin = oid;
+        if (sample_slot(&a->sconf->meta->samples, key, keylen) >= 0) {
+            sample_note(a, key, keylen, expires);
+        }
+        return APR_SUCCESS;
+    }
     a->stored++;
 
     if (a->full) {
+        w = apr_palloc(a->p, sizeof(*w));
+        memcpy(w->key, key, keylen);
+        w->exp = exp;
+        w->origin = oid;
+        apr_hash_set(a->written, w->key, (apr_ssize_t) keylen, w);
         a->fresh_active[oid][ipt]++;
     }
     else if (!had) {
         crowdsec_metrics_active_add(a->sconf, ipt, oid, 1);
     }
-    else if (had_origin != oid) {
+    else if (old.origin != oid) {
         /* The same network, re-attributed - a blocklist picking up an address
          * the community list already had, say. The population has not grown,
          * so move the count rather than adding to it.
          */
-        crowdsec_metrics_active_add(a->sconf, ipt, had_origin, -1);
+        crowdsec_metrics_active_add(a->sconf, ipt, old.origin, -1);
         crowdsec_metrics_active_add(a->sconf, ipt, oid, 1);
     }
 
@@ -568,6 +719,7 @@ apr_status_t crowdsec_store_apply_stream(server_rec *s,
     if (full) {
         a.gen = gen_take(sconf);
         sconf->meta->gen_applying = a.gen;
+        a.written = apr_hash_make(ptemp);
         /* The tracked keys belong to the snapshot being replaced, so the
          * eviction tally restarts with the one this pull is about to write.
          */
@@ -875,6 +1027,7 @@ static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
     unsigned char key[CROWDSEC_KEY_MAX];
     decision_value_t val;
     apr_size_t keylen;
+    apr_time_t expires = apr_time_now() + sconf->cache_timeout;
 
     if (!sconf->cache_instance || !sconf->meta) {
         return;
@@ -883,6 +1036,10 @@ static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
     if (!keylen) {
         return;
     }
+    /* exp and id are only read by the stream apply, which live mode never
+     * runs; zeroed so the whole value is initialised.
+     */
+    memset(&val, 0, sizeof(val));
     val.version = DECISION_VALUE_VERSION;
     val.rem = (unsigned char) rem;
     val.origin = origin;
@@ -895,8 +1052,7 @@ static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
      */
     gen_put(&val, sconf->meta->gen);
     sconf->cache_provider->store(sconf->cache_instance, r->server, key,
-                                 (unsigned int) keylen,
-                                 apr_time_now() + sconf->cache_timeout,
+                                 (unsigned int) keylen, expires,
                                  (unsigned char *) &val, sizeof(val),
                                  r->pool);
     crowdsec_store_unlock(sconf);

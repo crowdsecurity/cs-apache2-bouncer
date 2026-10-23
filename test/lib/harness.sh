@@ -43,8 +43,37 @@ harness_cleanup_apache() {
     fi
 }
 
+# A port nothing is listening on, and never one this harness already handed
+# out. The probe socket has to be closed before the port can be used, so the
+# kernel is free to hand the same one to the next draw; when that happens a
+# stub binds it first and apache dies with EADDRINUSE. Drawn ports are
+# remembered in the test's temp dir, which also keeps the deliberately-dead
+# ports some tests ask for from landing on a live stub.
 harness_free_port() {
-    python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'
+    python3 - "${HARNESS_DIR:-}" <<'PORTEOF'
+import os, socket, sys
+
+state = os.path.join(sys.argv[1], "ports") if sys.argv[1] else None
+taken = set()
+if state and os.path.exists(state):
+    with open(state) as f:
+        taken = {int(line) for line in f.read().split()}
+
+for _ in range(100):
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    if port not in taken:
+        break
+else:
+    sys.exit("no free port outside %s" % sorted(taken))
+
+if state:
+    with open(state, "a") as f:
+        f.write("%d\n" % port)
+print(port)
+PORTEOF
 }
 
 # Stub CrowdSec endpoint.

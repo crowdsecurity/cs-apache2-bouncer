@@ -40,7 +40,8 @@ EXTRA_DIST = $(CROWDSEC_SRC) $(CROWDSEC_HDRS) \
              test/unit/mod_scan_conformance.c \
              test/bats/appsec.bats test/bats/appsec-body.bats \
              test/bats/blocked-http-code.bats test/bats/challenge.bats \
-             test/bats/connect.bats test/bats/gating.bats \
+             test/bats/connect.bats test/bats/directives.bats \
+             test/bats/gating.bats \
              test/bats/http-client.bats test/bats/limits.bats \
              test/bats/live-mode.bats test/bats/metrics.bats \
              test/bats/regressions.bats \

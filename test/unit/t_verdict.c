@@ -35,6 +35,7 @@ typedef struct
     apr_size_t keylen[MAX_SEEN];
     apr_interval_time_t dur[MAX_SEEN];
     char origin[MAX_SEEN][CROWDSEC_ORIGIN_LEN];
+    apr_int64_t id[MAX_SEEN];
     apr_status_t rv;            /* what to return, for the abort test */
 } collector_t;
 
@@ -49,6 +50,7 @@ static apr_status_t collect(void *ctx, int added,
                                               CROWDSEC_KEY_MAX);
         c->dur[c->n] = d->duration;
         apr_cpystrn(c->origin[c->n], d->origin, CROWDSEC_ORIGIN_LEN);
+        c->id[c->n] = d->id;
         c->n++;
     }
     return c->rv;
@@ -123,6 +125,43 @@ static void test_stream_deleted(apr_pool_t *p)
               &c, &st, &err), "both lists");
     CHECK(c.n == 2 && c.added[0] == 0 && c.added[1] == 1,
           "removal applied before the add");
+}
+
+/* The id is what lets a removal tell the decision the store holds for a
+ * network from another one for the same network, so it has to survive the
+ * parse on both lists - and anything that is not a positive integer must read
+ * as 0, "unknown", rather than as some other decision's id.
+ */
+static void test_stream_id(apr_pool_t *p)
+{
+    collector_t c;
+    crowdsec_decision_stats_t st;
+    const char *err;
+
+    CHECK(run(p, "{\"deleted\":[{\"id\":7,\"scope\":\"Ip\","
+              "\"value\":\"1.2.3.4\",\"duration\":\"-2s\"}],"
+              "\"new\":[{\"id\":9007199254740993,\"scope\":\"Ip\","
+              "\"value\":\"1.2.3.4\",\"duration\":\"1h\"}]}",
+              &c, &st, &err), "ids: %s", err ? err : "");
+    CHECK(c.n == 2 && c.id[0] == 7, "a removal keeps its id");
+    CHECK(c.n == 2 && c.id[1] == APR_INT64_C(9007199254740993),
+          "an id past 2^53 is kept exactly");
+
+    CHECK(run(p, "{\"new\":["
+              "{\"scope\":\"Ip\",\"value\":\"1.1.1.1\",\"duration\":\"1h\"},"
+              "{\"id\":\"5\",\"scope\":\"Ip\",\"value\":\"1.1.1.2\","
+              "\"duration\":\"1h\"},"
+              "{\"id\":-3,\"scope\":\"Ip\",\"value\":\"1.1.1.3\","
+              "\"duration\":\"1h\"},"
+              "{\"id\":1.5,\"scope\":\"Ip\",\"value\":\"1.1.1.4\","
+              "\"duration\":\"1h\"},"
+              "{\"id\":18446744073709551615,\"scope\":\"Ip\","
+              "\"value\":\"1.1.1.5\",\"duration\":\"1h\"}]}",
+              &c, &st, &err), "odd ids: %s", err ? err : "");
+    CHECK(c.n == 5 && st.added == 5, "an odd id does not reject the decision");
+    CHECK(c.id[0] == 0 && c.id[1] == 0 && c.id[2] == 0 && c.id[3] == 0
+          && c.id[4] == 0,
+          "absent, string, negative, fractional and oversized ids read as 0");
 }
 
 static void test_stream_rejects(apr_pool_t *p)
@@ -653,6 +692,7 @@ int main(void)
 
     test_stream_basic(p);
     test_stream_deleted(p);
+    test_stream_id(p);
     test_stream_rejects(p);
     test_stream_malformed_doc(p);
     test_depth_limit(p);

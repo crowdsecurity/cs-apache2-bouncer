@@ -880,7 +880,20 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_post_config(crowdsec_post_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_child_init(crowdsec_child_init, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_handler(crowdsec_status_handler, NULL, NULL, APR_HOOK_MIDDLE);
-    ap_hook_access_checker(crowdsec_check_access, NULL, NULL, APR_HOOK_FIRST);
+    /* header_parser, not access_checker: the access phase is subject to
+     * Satisfy, and under Satisfy Any a refusal from access_checker only means
+     * "try authentication instead" - a grant from authorization, or from an
+     * Allow the client passes, then serves a banned request, and runs the
+     * handler after a challenge page has been written. Satisfy can be set
+     * from .htaccess, so that was a bypass any site owner could switch on.
+     *
+     * header_parser runs once the per-directory configuration is merged, so
+     * scoping is unchanged, and any status it returns ends the request before
+     * the access phase is reached. Last, so the request is decided as late as
+     * it was before: every other header parser - SetEnvIf among them - has
+     * already run.
+     */
+    ap_hook_header_parser(crowdsec_check_access, NULL, NULL, APR_HOOK_LAST);
     crowdsec_appsec_register(p);
 }
 

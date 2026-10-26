@@ -44,6 +44,7 @@ Requires `apache2` plus, in `/usr/lib/apache2/modules`, `mod_mpm_prefork`,
 | `challenge.bats` | relaying the interstitial, cookies, headers, the internal endpoints, failing closed |
 | `appsec-body.bats` | body inspection and replay, the limit, drop vs bypass, chunked, gzip, LimitRequestBody |
 | `gating.bats` | which requests reach the lookup: reverse proxy, internal redirects, vhosts inheriting the cache |
+| `satisfy.bats` | `Satisfy Any` (config, `Allow`, credentials, `.htaccess`) cannot override a ban, a WAF block or a challenge |
 | `regressions.bats` | the issues 0.1 left open: basic auth, redirects, ProxyPreserveHost, the user agent |
 
 Both MPMs are covered; `HARNESS_MPM=event` switches, and tests needing several

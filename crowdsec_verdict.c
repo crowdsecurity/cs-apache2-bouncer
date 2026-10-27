@@ -112,6 +112,16 @@ static void decision_origin(yyjson_val *item, char *out, apr_size_t outlen)
     }
     apr_cpystrn(out, origin, outlen);
 }
+/* The decision's id, or 0 (never a real id) when absent or invalid. */
+static apr_int64_t decision_id(yyjson_val *item)
+{
+    yyjson_val *v = yyjson_obj_get(item, "id");
+
+    if (v && yyjson_is_uint(v) && yyjson_get_uint(v) <= APR_INT64_MAX) {
+        return (apr_int64_t) yyjson_get_uint(v);
+    }
+    return 0;
+}
 
 static int one_decision(yyjson_val *item, int added,
                         crowdsec_decision_cb cb, void *ctx,
@@ -162,6 +172,7 @@ static int one_decision(yyjson_val *item, int added,
     }
 
     decision_origin(item, d.origin, sizeof(d.origin));
+    d.id = decision_id(item);
 
     *cbrv = cb(ctx, added, &d);
     if (*cbrv != APR_SUCCESS) {

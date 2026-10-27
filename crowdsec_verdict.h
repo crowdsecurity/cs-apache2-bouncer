@@ -32,6 +32,8 @@ typedef struct
 {
     crowdsec_net_t net;         /* already masked to its prefix */
     apr_interval_time_t duration;
+    /* LAPI's id for this decision, or 0 when absent. */
+    apr_int64_t id;
     /* Who decided: "crowdsec", "cscli", "CAPI", "console", or
      * "lists:<blocklist name>" composed from origin and scenario. Inline
      * rather than a pointer into the document, because composing it is the one

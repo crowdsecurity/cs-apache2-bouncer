@@ -112,10 +112,7 @@ static void decision_origin(yyjson_val *item, char *out, apr_size_t outlen)
     }
     apr_cpystrn(out, origin, outlen);
 }
-/* The decision's id, or 0 when it is absent or not a positive integer. 0 is
- * never a real id - the engine's ids start at 1 - so it doubles as "unknown",
- * and a removal carrying it falls back to removing whatever the store holds.
- */
+/* The decision's id, or 0 (never a real id) when absent or invalid. */
 static apr_int64_t decision_id(yyjson_val *item)
 {
     yyjson_val *v = yyjson_obj_get(item, "id");

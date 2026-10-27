@@ -299,9 +299,7 @@ decision() {
 }
 
 # decision_typed <value> <scope> <type> [duration] [id]
-# Like decision(), but with another type, and an id of its own: the store tells
-# decisions for the same network apart by id, so a test with several needs
-# them to differ.
+# Like decision(), with a type and an id of its own.
 decision_typed() {
     printf '{"duration":"%s","id":%s,"origin":"cscli","scenario":"manual","scope":"%s","type":"%s","value":"%s"}' \
         "${4:-1h0m0s}" "${5:-1}" "$2" "$3" "$1"

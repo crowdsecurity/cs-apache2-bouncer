@@ -32,10 +32,7 @@ typedef struct
 {
     crowdsec_net_t net;         /* already masked to its prefix */
     apr_interval_time_t duration;
-    /* The local API's id for this decision, or 0 when it was absent. Kept so a
-     * removal can tell whether it is withdrawing the decision the store holds
-     * for this network or another one that was shadowed by it.
-     */
+    /* LAPI's id for this decision, or 0 when absent. */
     apr_int64_t id;
     /* Who decided: "crowdsec", "cscli", "CAPI", "console", or
      * "lists:<blocklist name>" composed from origin and scenario. Inline

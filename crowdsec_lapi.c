@@ -60,20 +60,14 @@ apr_status_t crowdsec_meta_create(apr_pool_t *pconf,
 
 #define DECISION_VALUE_VERSION 4
 
-/* Seventeen bytes per decision. Shmcb's own per-entry overhead dominates
- * either way - the directive docs budget ~128 bytes per decision - so the
- * sizing guidance does not move.
+/* Seventeen bytes per decision; shmcb's ~128-byte per-entry overhead
+ * dominates, so the sizing guidance does not change.
  *
- * Multi-byte fields are split into bytes rather than declared as integers so
- * the struct has no padding: it is memcpy'd into the socache whole, and
- * padding would be an uninitialised read on every store.
+ * Multi-byte fields are stored as bytes so the struct has no padding: it is
+ * memcpy'd into the socache whole.
  *
- * Any change to the layout bumps the version, because a value written by
- * another layout would be read as nonsense. That costs nothing in practice:
- * the socache and this control region are created together in post_config and
- * recreated together on a restart, so values from an older layout never
- * coexist with this code. It does mean a version mismatch must read as a
- * miss, and in stream mode a miss means the client is not blocked.
+ * Any layout change bumps the version. Old values never coexist with new
+ * code (the socache is recreated on restart), and a mismatch reads as a miss.
  */
 typedef struct
 {
@@ -82,18 +76,10 @@ typedef struct
     unsigned char origin;       /* slot id in the shared metrics table */
     unsigned char gen_hi;
     unsigned char gen_lo;
-    /* There is one entry per network, but the engine can hold several
-     * decisions for it - a local ban for an address the community blocklist
-     * also carries, say. All of them are enforced as a ban, so the entry holds
-     * whichever lasts longest, and records which one that is: exp is when it
-     * ends, in seconds since the epoch, and id is the engine's id for it, both
-     * big-endian. The socache keeps its own expiry but will not tell us.
-     *
-     * The id is what makes removals safe. When a shorter decision for the
-     * network ends, the stream reports it as deleted, and without the id that
-     * removal would take out the entry holding the longer one. The expiry
-     * cannot stand in for it: the engine reports a decision deleted by hand
-     * with an elapsed duration, the same as one that ran out.
+    /* One entry per network holds the longest of its decisions: exp is
+     * when it ends (epoch seconds) and id is LAPI's id for it, both
+     * big-endian. The id lets a removal of a shorter decision leave the entry
+     * alone; exp cannot, since a manual delete also looks expired.
      */
     unsigned char exp[4];
     unsigned char id[8];
@@ -143,9 +129,7 @@ static int value_ok(const crowdsec_server_rec *sconf,
         && gen_ok(sconf, v);
 }
 
-/* Whole seconds, rounded up so a decision never ends early. Durations are
- * capped at ten years, so this fits until 2096.
- */
+/* Whole seconds, rounded up; fits until 2096. */
 static apr_uint32_t exp_sec(apr_time_t t)
 {
     apr_time_t sec = apr_time_sec(t + APR_USEC_PER_SEC - 1);
@@ -276,18 +260,13 @@ typedef struct
     unsigned int full:1;
     apr_uint16_t gen;           /* generation this batch writes */
     apr_uint32_t fresh_active[CROWDSEC_ORIGIN_MAX][CROWDSEC_IPT_MAX];
-    /* Full pull only: what this pull has written so far, by key, so that a
-     * second decision for a network can be compared with the first without a
-     * socache read for every one of six figures of decisions. The store from
-     * before the pull is no help there anyway - it belongs to the snapshot
-     * being replaced, whose decisions may have been withdrawn since.
+    /* Full pull only: keys written so far, so a second decision for a
+     * network is compared without a socache read.
      */
     apr_hash_t *written;
 } apply_ctx_t;
 
-/* One entry of apply_ctx_t.written. The key is copied in alongside, because
- * the caller's buffer does not outlive the call.
- */
+/* One entry of apply_ctx_t.written; owns a copy of its key. */
 typedef struct
 {
     unsigned char key[CROWDSEC_KEY_MAX];
@@ -320,12 +299,7 @@ static apr_status_t apply_yield(apply_ctx_t *a)
     return APR_SUCCESS;
 }
 
-/* The entry this key holds in the snapshot in force, if any. One read serves
- * everything an incremental batch needs to know about it: whether it exists,
- * for the active_decisions gauge; which origin it is attributed to, for the
- * same; and which decision it holds and until when, to decide whether a new
- * decision replaces it and whether a removal is aimed at it.
- */
+/* The current entry for this key, if any. */
 static int read_entry(apply_ctx_t *a, const unsigned char *key,
                       apr_size_t keylen, decision_value_t *out)
 {
@@ -394,15 +368,9 @@ static void sample_forget(apply_ctx_t *a, const unsigned char *key,
     }
 }
 
-/* A removal from the stream. The entry for a network holds only the
- * longest-lasting of its decisions, so a removal of any other one - a shorter
- * ban running out while a blocklist still carries the address - must leave it
- * alone. Without an id on either side there is nothing to compare, and the
- * entry goes.
- *
- * Removing the decision the entry does hold leaves the network unblocked even
- * if a shorter decision for it is still running, because that one was never
- * stored. The next full pull puts it back.
+/* Removes the entry only if it holds this decision, or if either id is
+ * unknown. A shorter decision shadowed by the removed one is restored by the
+ * next full pull.
  */
 static void apply_removal(apply_ctx_t *a, const crowdsec_decision_t *d,
                           const unsigned char *key, apr_size_t keylen)
@@ -418,9 +386,7 @@ static void apply_removal(apply_ctx_t *a, const crowdsec_decision_t *d,
                                      key, (unsigned int) keylen, a->p);
     sample_forget(a, key, keylen);
     if (had) {
-        /* The stream says what to remove, not what it was attributed to, so
-         * the origin comes from the store.
-         */
+        /* The origin comes from the store, not the stream. */
         crowdsec_metrics_active_add(a->sconf, net_ipt(&d->net), old.origin,
                                     -1);
     }
@@ -460,14 +426,9 @@ static apr_status_t apply_one(void *ctx, int added,
         return APR_SUCCESS;
     }
 
-    /* Several decisions for one network all enforce the same ban, so the one
-     * that lasts longest is kept; see decision_value_t. A tie goes to the
-     * newcomer, which is what keeps a blocklist refresh - the same addresses
-     * re-issued under new ids - from leaving entries that its removal of the
-     * old ids would then take out.
-     *
-     * A full pull compares only with what it has itself written: the store
-     * from before it belongs to the snapshot being replaced.
+    /* Keep the longest decision. A tie goes to the newcomer, so a blocklist
+     * re-issued under new ids is not removed with the old ids. A full pull
+     * compares only with what it has written itself.
      */
     if (a->full) {
         w = apr_hash_get(a->written, key, (apr_ssize_t) keylen);
@@ -507,10 +468,7 @@ static apr_status_t apply_one(void *ctx, int added,
                                         a->p) != APR_SUCCESS) {
         a->store_failures++;
         if (w) {
-            /* Replacing an entry this pull wrote. Whether the cache kept the
-             * old value is unknown, so count it as gone rather than leave the
-             * gauge claiming it.
-             */
+            /* The old value may be gone too: stop counting it. */
             a->fresh_active[w->origin][ipt]--;
             a->stored--;
             apr_hash_set(a->written, w->key, (apr_ssize_t) keylen, NULL);
@@ -520,10 +478,8 @@ static apr_status_t apply_one(void *ctx, int added,
     plen_set(d->net.family == 6 ? &a->plens6 : &a->plens4, d->net.plen);
 
     if (w) {
-        /* A longer decision for a network this pull already wrote: the same
-         * entry, so it is not counted again, only re-attributed. A sample
-         * tracking it must follow the new expiry, or it would stop looking
-         * when the shorter decision would have ended.
+        /* Same entry, longer decision: re-attribute it, and move any
+         * sample tracking it to the new expiry.
          */
         a->fresh_active[w->origin][ipt]--;
         a->fresh_active[oid][ipt]++;
@@ -1036,8 +992,8 @@ static void live_cache_put(request_rec *r, crowdsec_server_rec *sconf,
     if (!keylen) {
         return;
     }
-    /* exp and id are only read by the stream apply, which live mode never
-     * runs; zeroed so the whole value is initialised.
+    /* exp and id are unused in live mode; zeroed so nothing is
+     * uninitialised.
      */
     memset(&val, 0, sizeof(val));
     val.version = DECISION_VALUE_VERSION;

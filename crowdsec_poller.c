@@ -252,11 +252,9 @@ static apr_status_t do_pull(server_rec *s, crowdsec_server_rec *sconf,
  */
 #define POLLER_POOL_MAX_FREE (4 * 1024 * 1024)
 
-/* The longest the store goes without a full pull. An incremental pull cannot
- * restore a decision the store dropped - one shadowed by a longer decision for
- * the same network when that one is removed, or one the cache force-expired -
- * and only a full snapshot carries it again. With metrics on, the reporting
- * thread already asks for one per window; this covers metrics off.
+/* Longest gap between full pulls. Only a full pull restores a decision the
+ * store dropped (shadowed, or evicted). Metrics already asks for one per
+ * window; this covers metrics off.
  */
 #define POLLER_RESYNC_EVERY apr_time_from_sec(900)
 

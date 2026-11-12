@@ -114,6 +114,60 @@ Crowdsec On"
     [ "$(http_status)" = 200 ]
 }
 
+# Several decisions for one address share its single cache entry, which must
+# hold whichever lasts longest. Each test is arranged so that keeping the last
+# one to arrive - the old behaviour - fails it.
+
+@test "a shorter decision arriving last does not cut a longer one short" {
+    lapi_set "{\"decisions\":[$(decision_typed 127.0.0.1 Ip ban 1h0m0s 1),$(decision_typed 127.0.0.1 Ip captcha 2s 2)]}"
+    apache_start "$(stream_conf)"
+    wait_primed
+    [ "$(http_status)" = 429 ]
+    sleep 4
+    [ "$(http_status)" = 429 ]
+}
+
+@test "a longer decision arriving last replaces a shorter one" {
+    # The other order, so keeping the first one to arrive fails too.
+    lapi_set "{\"decisions\":[$(decision_typed 127.0.0.1 Ip ban 2s 1),$(decision_typed 127.0.0.1 Ip captcha 1h0m0s 2)]}"
+    apache_start "$(stream_conf)"
+    wait_primed
+    [ "$(http_status)" = 429 ]
+    sleep 4
+    [ "$(http_status)" = 429 ]
+}
+
+@test "a shorter decision in an incremental pull does not cut a longer one short" {
+    lapi_set "{\"decisions\":[$(decision_typed 127.0.0.1 Ip ban 1h0m0s 1)]}"
+    apache_start "$(stream_conf)"
+    wait_primed
+    [ "$(http_status)" = 429 ]
+
+    lapi_set "{\"decisions\":[$(decision_typed 127.0.0.1 Ip ban 2s 2)]}"
+    sleep 4
+    [ "$(http_status)" = 429 ]
+}
+
+@test "removing a shorter decision leaves the longer one blocking" {
+    # What a real engine does when a short ban runs out on an address a
+    # blocklist also carries: the short one is reported deleted. Removing the
+    # entry on that would unblock an address that is still banned.
+    lapi_set "{\"decisions\":[$(decision_typed 127.0.0.1 Ip ban 1h0m0s 1),$(decision_typed 127.0.0.1 Ip ban 1h0m0s 2)]}"
+    apache_start "$(stream_conf)"
+    wait_primed
+    [ "$(http_status)" = 429 ]
+
+    # Same expiry, so the entry holds id 2, the later one; withdraw id 1.
+    lapi_set "{\"decisions\":[],\"deleted\":[$(decision_typed 127.0.0.1 Ip ban -1s 1)]}"
+    sleep 3
+    [ "$(http_status)" = 429 ]
+
+    # And withdrawing the one it holds does unblock.
+    lapi_set "{\"decisions\":[],\"deleted\":[$(decision_typed 127.0.0.1 Ip ban -1s 2)]}"
+    sleep 3
+    [ "$(http_status)" = 200 ]
+}
+
 @test "an expired decision is never stored" {
     lapi_set "{\"decisions\":[$(decision 127.0.0.1 Ip -5s)],\"sticky\":true}"
     apache_start "$(stream_conf)"

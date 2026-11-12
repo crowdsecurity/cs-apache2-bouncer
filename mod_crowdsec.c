@@ -880,7 +880,12 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_post_config(crowdsec_post_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_child_init(crowdsec_child_init, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_handler(crowdsec_status_handler, NULL, NULL, APR_HOOK_MIDDLE);
-    ap_hook_access_checker(crowdsec_check_access, NULL, NULL, APR_HOOK_FIRST);
+    /* header_parser, not access_checker: under Satisfy Any (settable from
+     * .htaccess) Apache lets authorization override an access_checker
+     * refusal. Per-dir config is already merged here, and last keeps us
+     * after the other header parsers, as before.
+     */
+    ap_hook_header_parser(crowdsec_check_access, NULL, NULL, APR_HOOK_LAST);
     crowdsec_appsec_register(p);
 }
 
